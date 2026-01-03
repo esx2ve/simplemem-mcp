@@ -2,13 +2,13 @@
 
 Lightweight MCP client for SimpleMem - long-term memory for Claude Code.
 
-## Installation
+## Quick Start
 
 ```bash
-# Add to Claude Code
-claude mcp add simplemem --command "uvx simplemem-mcp serve"
+# Interactive setup (recommended)
+uvx simplemem-mcp setup
 
-# Or with API key
+# Or manual configuration
 claude mcp add simplemem --command "uvx simplemem-mcp serve" \
   --env SIMPLEMEM_API_KEY=<your-key>
 ```
@@ -16,9 +16,12 @@ claude mcp add simplemem --command "uvx simplemem-mcp serve" \
 ## Commands
 
 ```bash
+simplemem-mcp setup    # Interactive setup wizard
+simplemem-mcp doctor   # Diagnose configuration issues
 simplemem-mcp serve    # Run MCP server (for Claude Code)
 simplemem-mcp signup   # Get an API key
 simplemem-mcp config   # Show configuration
+simplemem-mcp undo     # Restore previous config
 simplemem-mcp version  # Show version
 ```
 
