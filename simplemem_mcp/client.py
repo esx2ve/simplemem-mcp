@@ -6,6 +6,7 @@ handling compression, authentication, and error mapping.
 
 import logging
 import os
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -14,6 +15,9 @@ from simplemem_mcp import DEFAULT_BACKEND_URL
 from simplemem_mcp.compression import compress_if_large
 
 log = logging.getLogger("simplemem_mcp.client")
+
+# Local hosts that don't require HTTPS
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 COMPRESSION_THRESHOLD = 4096  # 4KB - compress payloads larger than this
 
@@ -49,6 +53,14 @@ class BackendClient:
             base_url: Backend API URL (defaults to SIMPLEMEM_BACKEND_URL env or cloud)
             api_key: API key for authentication (defaults to SIMPLEMEM_API_KEY env)
             timeout: Request timeout in seconds
+
+        Raises:
+            ValueError: If API key is used with non-HTTPS remote backend
+
+        Security:
+            When an API key is provided, HTTPS is required for remote backends
+            to prevent credential leakage. Local backends (localhost, 127.0.0.1)
+            are exempt for development convenience.
         """
         self.base_url = (
             base_url
@@ -58,6 +70,30 @@ class BackendClient:
         self.api_key = api_key or os.environ.get("SIMPLEMEM_API_KEY")
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+
+        # Enforce HTTPS for remote backends when using API key
+        if self.api_key:
+            self._validate_https_for_api_key()
+
+    def _validate_https_for_api_key(self) -> None:
+        """Validate that HTTPS is used when API key is present.
+
+        Raises:
+            ValueError: If using HTTP with API key on non-local backend
+        """
+        parsed = urllib.parse.urlparse(self.base_url)
+        hostname = parsed.hostname or ""
+
+        # Allow HTTP for local development
+        is_local = hostname.lower() in LOCAL_HOSTS
+
+        if not is_local and parsed.scheme != "https":
+            raise ValueError(
+                f"HTTPS required when using API key with remote backend. "
+                f"Got: {self.base_url}. "
+                f"Either use https:// URL, remove API key for insecure local dev, "
+                f"or use localhost/127.0.0.1 for local development."
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the async HTTP client."""

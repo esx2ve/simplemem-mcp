@@ -7,11 +7,18 @@ preparing them for compression and transport to the backend API.
 import fnmatch
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 log = logging.getLogger("simplemem_mcp.local_reader")
+
+# UUID pattern for session ID validation (prevents path traversal)
+UUID_PATTERN = re.compile(
+    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+    re.IGNORECASE,
+)
 
 # Default patterns for code files
 DEFAULT_CODE_PATTERNS = [
@@ -124,8 +131,27 @@ class LocalReader:
 
         Returns:
             Path to trace file if found
+
+        Security:
+            - Validates session_id is a valid UUID format (prevents path traversal)
+            - Ensures resolved path stays within traces_dir (defense in depth)
         """
+        # Validate session_id format to prevent path traversal attacks
+        # e.g., blocking "../../etc/passwd" or "../../../sensitive"
+        if not UUID_PATTERN.match(session_id):
+            log.warning(
+                f"Invalid session_id format (expected UUID): {session_id[:50]!r}"
+            )
+            return None
+
         if not self.traces_dir.exists():
+            return None
+
+        # Resolve traces_dir once for path containment check
+        try:
+            traces_dir_resolved = self.traces_dir.resolve()
+        except (OSError, ValueError):
+            log.error(f"Could not resolve traces directory: {self.traces_dir}")
             return None
 
         for project_dir in self.traces_dir.iterdir():
@@ -133,6 +159,16 @@ class LocalReader:
                 continue
 
             trace_file = project_dir / f"{session_id}.jsonl"
+
+            # Defense in depth: ensure resolved path is within traces_dir
+            try:
+                resolved = trace_file.resolve()
+                if not str(resolved).startswith(str(traces_dir_resolved)):
+                    log.warning(f"Path escape attempt blocked: {trace_file}")
+                    continue
+            except (OSError, ValueError):
+                continue
+
             if trace_file.exists():
                 return trace_file
 
