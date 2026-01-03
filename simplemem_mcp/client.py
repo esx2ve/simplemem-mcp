@@ -394,8 +394,23 @@ class BackendClient:
     async def run_cypher_query(
         self, query: str, params: dict | None = None, max_results: int = 100
     ) -> dict:
-        """Execute a Cypher query against the graph."""
-        data = {"query": query, "max_results": max_results}
+        """Execute a Cypher query against the graph.
+
+        In PROD mode, if query matches a template name (no spaces, alphanumeric + underscore),
+        it's sent as query_name. Otherwise sent as raw query (requires DEV mode).
+        """
+        data: dict = {"max_results": max_results}
+
+        # Check if query looks like a template name (no spaces, simple identifier)
+        # Template names: get_memory, all_goals, session_goals, etc.
+        import re
+        if re.match(r'^[a-z][a-z0-9_]*$', query):
+            # Looks like a template name
+            data["query_name"] = query
+        else:
+            # Raw Cypher query (only works in DEV mode)
+            data["query"] = query
+
         if params:
             data["params"] = params
         return await self._request("POST", "/api/v1/graph/query", json_data=data)
