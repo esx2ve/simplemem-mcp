@@ -5,14 +5,18 @@ Monitors file changes and sends updates through the BackendClient to the cloud A
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import requests
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+
+from simplemem_mcp import DEFAULT_BACKEND_URL
 
 if TYPE_CHECKING:
     from simplemem_mcp.client import BackendClient
@@ -361,33 +365,41 @@ class CloudWatcherManager:
         self.reader = reader
         self._watchers: dict[str, dict] = {}  # project_root -> {observer, worker, queue}
         self._lock = threading.Lock()
-        self._status_loop: asyncio.AbstractEventLoop | None = None
+        # Cache credentials from client for sync status reporting
+        self._base_url = client.base_url
+        self._api_key = client.api_key
 
     def _report_status(self) -> None:
-        """Report watcher status to backend for statusline."""
+        """Report watcher status to backend for statusline.
+
+        Uses synchronous HTTP to avoid async/threading issues when called
+        from watchdog callbacks.
+        """
         try:
             with self._lock:
                 watcher_count = len(self._watchers)
                 projects = list(self._watchers.keys())
 
-            # Create event loop for sync context if needed
-            if self._status_loop is None or self._status_loop.is_closed():
-                self._status_loop = asyncio.new_event_loop()
+            # Use cached credentials from client (set at init time)
+            base_url = self._base_url
+            api_key = self._api_key
 
-            # Use a fresh client for status updates to avoid cross-loop issues
-            from simplemem_mcp.client import BackendClient
-            status_client = BackendClient()
+            url = f"{base_url}/api/v1/code/status"
+            headers = {}
+            if api_key:
+                headers["X-API-Key"] = api_key
 
-            async def update_status():
-                try:
-                    await status_client.update_code_index_status(
-                        watchers=watcher_count,
-                        projects_watching=projects,
-                    )
-                finally:
-                    await status_client.close()
-
-            self._status_loop.run_until_complete(update_status())
+            response = requests.post(
+                url,
+                json={
+                    "watchers": watcher_count,
+                    "projects_watching": projects,
+                },
+                headers=headers,
+                timeout=5,
+            )
+            response.raise_for_status()
+            log.debug(f"Reported watcher status: {watcher_count} watchers")
         except Exception as e:
             log.warning(f"Failed to report watcher status: {e}")
 
@@ -548,8 +560,3 @@ class CloudWatcherManager:
             keys = list(self._watchers.keys())
         for project_key in keys:
             self.stop_watching(project_key)
-
-        # Cleanup status loop
-        if self._status_loop and not self._status_loop.is_closed():
-            self._status_loop.close()
-            self._status_loop = None
