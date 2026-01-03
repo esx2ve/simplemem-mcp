@@ -333,6 +333,56 @@ class BackendClient:
             params["project_root"] = project_root
         return await self._request("GET", "/api/v1/code/stats", params=params)
 
+    async def update_code_index_status(
+        self,
+        status: str | None = None,
+        watchers: int | None = None,
+        projects_watching: list[str] | None = None,
+        indexing_in_progress: bool | None = None,
+        files_done: int | None = None,
+        files_total: int | None = None,
+        current_file: str | None = None,
+        total_files: int | None = None,
+        total_chunks: int | None = None,
+    ) -> dict:
+        """Update code index status on the backend for statusline display.
+
+        Args:
+            status: Overall status (idle, indexing, watching)
+            watchers: Number of active file watchers
+            projects_watching: List of project roots being watched
+            indexing_in_progress: Whether indexing is currently running
+            files_done: Files indexed so far
+            files_total: Total files to index
+            current_file: Currently indexing file path
+            total_files: Total indexed files (stats)
+            total_chunks: Total code chunks (stats)
+
+        Returns:
+            Status update confirmation
+        """
+        data: dict[str, Any] = {}
+        if status is not None:
+            data["status"] = status
+        if watchers is not None:
+            data["watchers"] = watchers
+        if projects_watching is not None:
+            data["projects_watching"] = projects_watching
+        if indexing_in_progress is not None:
+            data["indexing_in_progress"] = indexing_in_progress
+        if files_done is not None:
+            data["files_done"] = files_done
+        if files_total is not None:
+            data["files_total"] = files_total
+        if current_file is not None:
+            data["current_file"] = current_file
+        if total_files is not None:
+            data["total_files"] = total_files
+        if total_chunks is not None:
+            data["total_chunks"] = total_chunks
+
+        return await self._request("POST", "/api/v1/code/status", json_data=data)
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # GRAPH API
     # ═══════════════════════════════════════════════════════════════════════════════

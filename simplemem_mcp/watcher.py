@@ -361,6 +361,35 @@ class CloudWatcherManager:
         self.reader = reader
         self._watchers: dict[str, dict] = {}  # project_root -> {observer, worker, queue}
         self._lock = threading.Lock()
+        self._status_loop: asyncio.AbstractEventLoop | None = None
+
+    def _report_status(self) -> None:
+        """Report watcher status to backend for statusline."""
+        try:
+            with self._lock:
+                watcher_count = len(self._watchers)
+                projects = list(self._watchers.keys())
+
+            # Create event loop for sync context if needed
+            if self._status_loop is None or self._status_loop.is_closed():
+                self._status_loop = asyncio.new_event_loop()
+
+            # Use a fresh client for status updates to avoid cross-loop issues
+            from simplemem_mcp.client import BackendClient
+            status_client = BackendClient()
+
+            async def update_status():
+                try:
+                    await status_client.update_code_index_status(
+                        watchers=watcher_count,
+                        projects_watching=projects,
+                    )
+                finally:
+                    await status_client.close()
+
+            self._status_loop.run_until_complete(update_status())
+        except Exception as e:
+            log.warning(f"Failed to report watcher status: {e}")
 
     def start_watching(
         self,
@@ -422,11 +451,14 @@ class CloudWatcherManager:
                 "started_at": time.time(),
             }
 
-            return {
-                "status": "started",
-                "project_root": project_key,
-                "patterns": patterns,
-            }
+        # Report status update outside lock
+        self._report_status()
+
+        return {
+            "status": "started",
+            "project_root": project_key,
+            "patterns": patterns,
+        }
 
     def stop_watching(self, project_root: str | Path) -> dict:
         """Stop watching a project directory.
@@ -458,6 +490,9 @@ class CloudWatcherManager:
 
         watcher["worker"].stop()
         watcher["worker"].join(timeout=5)
+
+        # Report status update after stopping
+        self._report_status()
 
         return {
             "status": "stopped",
@@ -513,3 +548,8 @@ class CloudWatcherManager:
             keys = list(self._watchers.keys())
         for project_key in keys:
             self.stop_watching(project_key)
+
+        # Cleanup status loop
+        if self._status_loop and not self._status_loop.is_closed():
+            self._status_loop.close()
+            self._status_loop = None
