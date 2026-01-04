@@ -272,8 +272,20 @@ class BackendClient:
         project_root: str,
         files: list[dict],
         clear_existing: bool = True,
+        background: bool = True,
     ) -> dict:
-        """Index code files via backend API."""
+        """Index code files via backend API.
+
+        Args:
+            project_root: Project root path for identification
+            files: List of {path, content} dicts
+            clear_existing: Clear existing index for this project
+            background: Run in background (default: True). Returns job_id immediately.
+
+        Returns:
+            If background=True: {job_id, status: "submitted", message: ...}
+            If background=False: {files_indexed, chunks_created, ...}
+        """
         compressed_files = []
         for file_info in files:
             content, was_compressed = compress_if_large(
@@ -288,6 +300,7 @@ class BackendClient:
             "project_root": project_root,
             "files": compressed_files,
             "clear_existing": clear_existing,
+            "background": background,
         }
         return await self._request("POST", "/api/v1/code/index", json_data=data)
 

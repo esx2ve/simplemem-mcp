@@ -499,22 +499,26 @@ async def index_directory(
     path: str,
     patterns: list[str] | None = None,
     clear_existing: bool = True,
+    background: bool = True,
 ) -> dict:
     """Index a directory for code search.
 
     Scans the directory for source files matching the patterns,
     splits them into semantic chunks, and adds to the search index.
+    Runs in background by default to return immediately.
 
     Args:
         path: Directory path to index
         patterns: Optional glob patterns (default: ['**/*.py', '**/*.ts', '**/*.js', '**/*.tsx', '**/*.jsx'])
         clear_existing: Whether to clear existing index for this directory (default: True)
+        background: Run in background (default: True). Use job_status to check progress.
 
     Returns:
-        Indexing statistics including files indexed and chunks created
+        If background=True: {job_id, status: "submitted", message: ...}
+        If background=False: Indexing statistics including files indexed and chunks created
     """
     try:
-        log.info(f"index_directory called (path={path})")
+        log.info(f"index_directory called (path={path}, background={background})")
 
         directory = Path(path)
         if not directory.exists():
@@ -539,6 +543,7 @@ async def index_directory(
             project_root=str(directory.absolute()),
             files=files,
             clear_existing=clear_existing,
+            background=background,
         )
     except BackendError as e:
         log.error(f"index_directory failed: {e}")
