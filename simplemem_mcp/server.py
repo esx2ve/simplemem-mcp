@@ -406,6 +406,8 @@ async def process_trace(
 @mcp.tool()
 async def discover_sessions(
     days_back: int = 30,
+    limit: int = 20,
+    offset: int = 0,
     group_by: str | None = None,
     include_indexed: bool = True,
 ) -> dict:
@@ -416,6 +418,8 @@ async def discover_sessions(
 
     Args:
         days_back: Only include sessions modified within this many days (default: 30)
+        limit: Maximum number of sessions to return (default: 20)
+        offset: Number of sessions to skip for pagination (default: 0)
         group_by: Optional grouping - "project" or "date" (default: None, flat list)
         include_indexed: Include already-indexed sessions in results (default: True)
 
@@ -423,20 +427,23 @@ async def discover_sessions(
         Dict containing:
         - sessions: List of session metadata (or grouped dict if group_by specified)
         - total_count: Total sessions found
+        - has_more: Whether more sessions are available
         - indexed_count: How many are already indexed
         - unindexed_count: How many are not yet indexed
     """
     try:
-        log.info(f"discover_sessions called (days_back={days_back})")
+        log.info(f"discover_sessions called (days_back={days_back}, limit={limit}, offset={offset})")
 
         reader = await _get_reader()
-        sessions = await asyncio.to_thread(reader.discover_sessions, days_back)
+        data = await asyncio.to_thread(reader.discover_sessions, days_back, limit, offset)
 
+        sessions = data.get("sessions", [])
         result = {
             "sessions": sessions,
-            "total_count": len(sessions),
+            "total_count": data.get("total", len(sessions)),
+            "has_more": data.get("has_more", False),
             "indexed_count": 0,
-            "unindexed_count": len(sessions),
+            "unindexed_count": data.get("total", len(sessions)),
         }
 
         if group_by == "project":

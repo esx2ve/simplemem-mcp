@@ -81,21 +81,25 @@ class LocalReader:
     def discover_sessions(
         self,
         days_back: int = 30,
-    ) -> list[dict]:
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict:
         """Discover available Claude Code sessions.
 
         Args:
             days_back: Only include sessions modified within this many days
+            limit: Maximum number of sessions to return (default: 20)
+            offset: Number of sessions to skip for pagination (default: 0)
 
         Returns:
-            List of session metadata dicts
+            Dict with sessions list, total count, and pagination info
         """
         sessions = []
         cutoff_time = datetime.now(timezone.utc).timestamp() - (days_back * 86400)
 
         if not self.traces_dir.exists():
             log.warning(f"Traces directory does not exist: {self.traces_dir}")
-            return sessions
+            return {"sessions": [], "total": 0, "has_more": False}
 
         for project_dir in self.traces_dir.iterdir():
             if not project_dir.is_dir():
@@ -107,21 +111,36 @@ class LocalReader:
                     if stat.st_mtime < cutoff_time:
                         continue
 
+                    # Extract human-readable project name from encoded path
+                    project_name = project_dir.name
+                    if project_name.startswith("-"):
+                        # Decode: "-Users-foo-repo-bar" -> "bar"
+                        parts = project_name.split("-")
+                        project_name = parts[-1] if parts else project_name
+
                     sessions.append({
-                        "session_id": trace_file.stem,
-                        "project": project_dir.name,
-                        "path": str(trace_file),
+                        "id": trace_file.stem[:8],  # Truncated UUID for display
+                        "session_id": trace_file.stem,  # Full UUID for operations
+                        "project": project_name,
                         "size_kb": stat.st_size // 1024,
                         "modified": stat.st_mtime,
-                        "modified_iso": datetime.fromtimestamp(
-                            stat.st_mtime, tz=timezone.utc
-                        ).isoformat(),
                     })
                 except (OSError, PermissionError) as e:
                     log.warning(f"Could not stat {trace_file}: {e}")
                     continue
 
-        return sorted(sessions, key=lambda x: x["modified"], reverse=True)
+        # Sort by most recent first
+        sessions = sorted(sessions, key=lambda x: x["modified"], reverse=True)
+        total = len(sessions)
+
+        # Apply pagination
+        paginated = sessions[offset:offset + limit]
+
+        return {
+            "sessions": paginated,
+            "total": total,
+            "has_more": offset + limit < total,
+        }
 
     def find_session_path(self, session_id: str) -> Path | None:
         """Find a session trace file by ID.
