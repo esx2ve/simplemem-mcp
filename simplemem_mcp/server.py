@@ -807,26 +807,40 @@ async def get_project_status(project_root: str) -> dict:
     try:
         log.info(f"get_project_status called (project_root={project_root})")
 
+        # Get local directory info
         reader = await _get_reader()
         info = await asyncio.to_thread(reader.get_directory_info, Path(project_root))
 
         if info is None:
             return {"error": "Could not read directory info"}
 
-        # Get actual watcher status
+        # Get local watcher status (watchers run on MCP side)
         manager = await _get_watcher_manager()
         watcher_status = manager.get_status(project_root)
         is_watching = watcher_status.get("is_watching", False)
 
+        # Get bootstrap status from cloud backend
+        client = await _get_client()
+        try:
+            backend_status = await client.get_project_status(project_root)
+            log.debug(f"Backend project status: {backend_status}")
+        except BackendError as e:
+            log.warning(f"Backend project status failed: {e}, using defaults")
+            backend_status = {}
+
+        # Merge local and cloud status
         return {
+            # Local info
             "exists": info.get("exists", False),
             "is_git": info.get("is_git", False),
             "file_count": info.get("file_count", 0),
-            "is_known": False,
-            "is_bootstrapped": False,
             "is_watching": is_watching,
-            "project_name": Path(project_root).name,
-            "should_ask": True,
+            # Cloud bootstrap status
+            "is_known": backend_status.get("is_known", False),
+            "is_bootstrapped": backend_status.get("is_bootstrapped", False),
+            "should_ask": backend_status.get("should_ask", True),
+            "project_name": backend_status.get("project_name") or Path(project_root).name,
+            "never_ask": backend_status.get("never_ask", False),
         }
     except Exception as e:
         log.error(f"get_project_status failed: {e}")

@@ -429,6 +429,53 @@ class BackendClient:
         return await self._request("POST", "/api/v1/graph/query", json_data=data)
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # PROJECTS API
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def get_project_status(self, project_root: str) -> dict:
+        """Get bootstrap and metadata status for a project.
+
+        Args:
+            project_root: Absolute path to the project root directory
+
+        Returns:
+            Dict with is_known, is_bootstrapped, should_ask, project_name, etc.
+        """
+        params = {"project_root": project_root}
+        return await self._request("GET", "/api/v1/projects/status", params=params)
+
+    async def set_bootstrap_status(
+        self,
+        project_root: str,
+        is_bootstrapped: bool = True,
+        never_ask: bool = False,
+    ) -> dict:
+        """Set the bootstrap status for a project.
+
+        Args:
+            project_root: Absolute path to the project root directory
+            is_bootstrapped: Whether the project has been bootstrapped
+            never_ask: If True, never prompt for bootstrap again
+
+        Returns:
+            Updated project state
+        """
+        data = {
+            "project_root": project_root,
+            "is_bootstrapped": is_bootstrapped,
+            "never_ask": never_ask,
+        }
+        return await self._request("POST", "/api/v1/projects/bootstrap", json_data=data)
+
+    async def list_projects(self) -> dict:
+        """List all tracked projects.
+
+        Returns:
+            Dict with projects list and count
+        """
+        return await self._request("GET", "/api/v1/projects/list")
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # HEALTH CHECK
     # ═══════════════════════════════════════════════════════════════════════════════
 
