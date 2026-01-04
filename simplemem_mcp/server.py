@@ -79,6 +79,32 @@ async def _get_watcher_manager() -> CloudWatcherManager:
     return _watcher_manager
 
 
+def _resolve_project_id(project_id: str | None) -> str | None:
+    """Resolve project_id, defaulting to canonical cwd if not provided.
+
+    The canonical project_id is the absolute path of the project root.
+    This ensures 1:1 mapping and easy discovery.
+
+    Args:
+        project_id: Optional explicit project_id
+
+    Returns:
+        Canonical project_id (absolute path) or None if cwd resolution fails
+    """
+    if project_id:
+        # Already provided - ensure it's canonical (absolute path)
+        return str(Path(project_id).expanduser().resolve())
+
+    # Auto-resolve from current working directory
+    try:
+        cwd = Path.cwd().resolve()
+        log.debug(f"Auto-resolved project_id from cwd: {cwd}")
+        return str(cwd)
+    except Exception as e:
+        log.warning(f"Failed to resolve project_id from cwd: {e}")
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MEMORY TOOLS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -104,7 +130,8 @@ async def store_memory(
     Returns:
         Dict with uuid of stored memory or error
     """
-    log.info(f"store_memory called (type={type}, project={project_id})")
+    resolved_project_id = _resolve_project_id(project_id)
+    log.info(f"store_memory called (type={type}, project={resolved_project_id})")
     try:
         client = await _get_client()
         result = await client.store_memory(
@@ -112,7 +139,7 @@ async def store_memory(
             type=type,
             source=source,
             relations=relations,
-            project_id=project_id,
+            project_id=resolved_project_id,
         )
         return {"uuid": result.get("uuid", "")}
     except BackendError as e:
@@ -143,15 +170,16 @@ async def search_memories(
     Returns:
         Dict with results list or error
     """
+    resolved_project_id = _resolve_project_id(project_id)
     try:
-        log.info(f"search_memories called (query='{query[:50]}...', limit={limit})")
+        log.info(f"search_memories called (query='{query[:50]}...', limit={limit}, project={resolved_project_id})")
         client = await _get_client()
         result = await client.search_memories(
             query=query,
             limit=limit,
             use_graph=use_graph,
             type_filter=type_filter,
-            project_id=project_id,
+            project_id=resolved_project_id,
         )
         return {"results": result.get("results", [])}
     except BackendError as e:
@@ -219,14 +247,15 @@ async def ask_memories(
     Returns:
         {answer, memories_used, cross_session_insights, confidence, sources}
     """
+    resolved_project_id = _resolve_project_id(project_id)
     try:
-        log.info(f"ask_memories called (query='{query[:50]}...', project={project_id})")
+        log.info(f"ask_memories called (query='{query[:50]}...', project={resolved_project_id})")
         client = await _get_client()
         return await client.ask_memories(
             query=query,
             max_memories=max_memories,
             max_hops=max_hops,
-            project_id=project_id,
+            project_id=resolved_project_id,
         )
     except BackendError as e:
         log.error(f"ask_memories failed: {e}")
@@ -259,18 +288,54 @@ async def reason_memories(
     Returns:
         {conclusions: [{uuid, content, type, score, proof_chain, hops}]}
     """
+    resolved_project_id = _resolve_project_id(project_id)
     try:
-        log.info(f"reason_memories called (query='{query[:50]}...', project={project_id})")
+        log.info(f"reason_memories called (query='{query[:50]}...', project={resolved_project_id})")
         client = await _get_client()
         return await client.reason_memories(
             query=query,
             max_hops=max_hops,
             min_score=min_score,
-            project_id=project_id,
+            project_id=resolved_project_id,
         )
     except BackendError as e:
         log.error(f"reason_memories failed: {e}")
         return {"error": e.detail}
+
+
+@mcp.tool()
+async def get_project_id(path: str | None = None) -> dict:
+    """Get the canonical project_id for a path or current working directory.
+
+    The project_id is the canonical absolute path, ensuring 1:1 mapping
+    between project paths and their IDs. This makes discovery trivial:
+    the project_id IS the absolute path.
+
+    Args:
+        path: Optional path to resolve (defaults to current working directory)
+
+    Returns:
+        {project_id: str, path: str} or {error: str}
+
+    Example:
+        get_project_id()  # Returns cwd as project_id
+        get_project_id("~/repo/myproject")  # Returns /Users/.../repo/myproject
+    """
+    try:
+        if path:
+            resolved = str(Path(path).expanduser().resolve())
+        else:
+            resolved = str(Path.cwd().resolve())
+
+        log.info(f"get_project_id called, resolved: {resolved}")
+        return {
+            "project_id": resolved,
+            "path": resolved,
+            "message": "Use this project_id with memory tools for isolation",
+        }
+    except Exception as e:
+        log.error(f"get_project_id failed: {e}")
+        return {"error": str(e)}
 
 
 @mcp.tool()
