@@ -105,6 +105,64 @@ def _resolve_project_id(project_id: str | None) -> str | None:
         return None
 
 
+def _decode_claude_path(encoded_path: str) -> str | None:
+    """Decode Claude's encoded project path format.
+
+    Claude Code stores traces in ~/.claude/projects/{encoded-path}/
+    where the path is encoded by replacing '/' with '-'.
+
+    Examples:
+        -Users-shimon-repo-project -> /Users/shimon/repo/project
+        -home-user-code-app -> /home/user/code/app
+
+    Args:
+        encoded_path: The encoded directory name from Claude's trace storage
+
+    Returns:
+        Decoded absolute path, or None if invalid
+    """
+    if not encoded_path or encoded_path == "-":
+        return "/"
+
+    # Claude encodes leading / as - and uses - as separator
+    # This is lossy for paths with actual dashes, but Claude's encoding
+    # makes that unavoidable
+    if encoded_path.startswith("-"):
+        decoded = "/" + encoded_path[1:].replace("-", "/")
+        return decoded
+
+    return encoded_path
+
+
+def _infer_project_from_session_path(session_path: Path) -> str | None:
+    """Infer project_id from a Claude trace file path.
+
+    Args:
+        session_path: Path to the session trace file (e.g., ~/.claude/projects/-Users-.../session.jsonl)
+
+    Returns:
+        Decoded project path (e.g., /Users/shimon/repo/project) or None
+    """
+    try:
+        # The parent directory name is the encoded project path
+        encoded_name = session_path.parent.name
+        decoded_path = _decode_claude_path(encoded_name)
+
+        if decoded_path:
+            # Validate the path exists (optional but helps catch decoding errors)
+            if Path(decoded_path).exists():
+                return decoded_path
+            else:
+                # Path doesn't exist - could be stale trace, still return decoded
+                log.debug(f"Decoded path doesn't exist (may be stale): {decoded_path}")
+                return decoded_path
+
+        return None
+    except Exception as e:
+        log.warning(f"Failed to infer project from session path: {e}")
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MEMORY TOOLS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -384,19 +442,29 @@ async def process_trace(
     try:
         log.info(f"process_trace called (session_id={session_id})")
 
-        # Read trace file locally (offload blocking I/O to thread)
         reader = await _get_reader()
-        trace_content = await asyncio.to_thread(reader.read_trace_file, session_id)
 
-        if trace_content is None:
+        # First find the session path to extract project_id
+        session_path = await asyncio.to_thread(reader.find_session_path, session_id)
+        if session_path is None:
             return {"error": f"Session {session_id} not found"}
 
-        # Send to backend for processing
+        # Infer project_id from the trace file path (Claude's encoded directory name)
+        project_id = _infer_project_from_session_path(session_path)
+        log.info(f"Inferred project_id from session path: {project_id}")
+
+        # Read trace content
+        trace_content = await asyncio.to_thread(reader.read_trace_file_by_path, session_path)
+        if trace_content is None:
+            return {"error": f"Failed to read trace file for session {session_id}"}
+
+        # Send to backend for processing with project_id
         client = await _get_client()
         return await client.process_trace(
             session_id=session_id,
             trace_content=trace_content,
             background=background,
+            project_id=project_id,
         )
     except BackendError as e:
         log.error(f"process_trace failed: {e}")

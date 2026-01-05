@@ -237,6 +237,7 @@ class BackendClient:
         session_id: str,
         trace_content: list | dict | str,
         background: bool = True,
+        project_id: str | None = None,
     ) -> dict:
         """Process a trace via backend API."""
         compressed, was_compressed = compress_if_large(
@@ -248,6 +249,8 @@ class BackendClient:
             "compressed": was_compressed,
             "background": background,
         }
+        if project_id:
+            data["project_id"] = project_id
         return await self._request("POST", "/api/v1/traces/process", json_data=data)
 
     async def get_job_status(self, job_id: str) -> dict:
