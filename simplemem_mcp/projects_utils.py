@@ -1,16 +1,19 @@
-"""Project ID utilities with hybrid identification strategies.
+"""Project ID utilities with deterministic identification strategies.
 
 Hierarchical project identification (most stable first):
 1. Git remote URL - stable across machines and paths
-2. Config file UUID (.simplemem.json) - explicit user control
-3. Content hash of project markers - semi-stable
-4. Resolved absolute path - fallback for backwards compatibility
+2. Config file (.simplemem.yaml) - explicit user control
+
+IMPORTANT: Hash-based and path-based project IDs are DEPRECATED.
+Projects MUST have either:
+- A git remote (preferred)
+- A .simplemem.yaml config file with explicit project_id
 
 ID Format Prefixes:
 - git:github.com/user/repo - Git remote based
-- uuid:550e8400-e29b-... - Config file UUID
-- hash:a1b2c3d4e5f6... - Content hash
-- path:/Users/dev/project - Fallback path
+- config:mycompany/myproject - Config file based
+- hash:a1b2c3d4e5f6... - DEPRECATED (legacy, will be removed)
+- path:/Users/dev/project - DEPRECATED (legacy, will be removed)
 """
 
 import hashlib
@@ -19,8 +22,17 @@ import logging
 import re
 import subprocess
 from pathlib import Path
+from typing import Any, Mapping
+
+import yaml
 
 log = logging.getLogger("simplemem_mcp.projects_utils")
+
+# Maximum directory levels to search upward for config
+CONFIG_SEARCH_MAX_DEPTH = 10
+
+# Config file names in order of preference
+CONFIG_FILES = [".simplemem.yaml", ".simplemem.yml", ".simplemem.json"]
 
 # Project marker files in priority order
 PROJECT_MARKERS = [
@@ -154,6 +166,83 @@ def load_simplemem_config(path: Path) -> dict | None:
     return None
 
 
+def load_simplemem_yaml(path: Path) -> dict | None:
+    """Load .simplemem.yaml config file if it exists.
+
+    Args:
+        path: Directory containing the config file (not the file path itself)
+
+    Returns:
+        Parsed config dict or None if not found/invalid
+    """
+    for config_name in [".simplemem.yaml", ".simplemem.yml"]:
+        config_path = path / config_name
+        if config_path.exists():
+            try:
+                with open(config_path, encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+
+                    # Validate structure
+                    if not isinstance(config, dict):
+                        log.warning(f"Config {config_path} must be a YAML mapping")
+                        continue
+
+                    # Validate project_id is a non-empty string
+                    project_id = config.get("project_id")
+                    if not isinstance(project_id, str) or not project_id.strip():
+                        log.warning(f"Config {config_path} requires 'project_id' to be a non-empty string")
+                        continue
+
+                    log.debug(f"Loaded YAML config from {config_path}")
+                    return config
+
+            except yaml.YAMLError as e:
+                log.warning(f"Failed to parse YAML config {config_path}: {e}")
+            except OSError as e:
+                log.warning(f"Failed to read config {config_path}: {e}")
+
+    return None
+
+
+def find_config_file(start_path: Path) -> tuple[Path, Mapping[str, Any]] | None:
+    """Walk up directory tree to find .simplemem.yaml config.
+
+    Searches from start_path upward (max CONFIG_SEARCH_MAX_DEPTH levels)
+    looking for .simplemem.yaml, .simplemem.yml, or .simplemem.json.
+
+    Args:
+        start_path: Starting directory for search
+
+    Returns:
+        Tuple of (config_directory, config_dict) or None if not found
+    """
+    current = start_path.resolve()
+    depth = 0
+
+    while depth < CONFIG_SEARCH_MAX_DEPTH:
+        # Try YAML config first (preferred)
+        yaml_config = load_simplemem_yaml(current)
+        if yaml_config:
+            log.debug(f"Found YAML config at {current} (depth={depth})")
+            return current, yaml_config
+
+        # Fall back to JSON config (legacy)
+        json_config = load_simplemem_config(current)
+        if json_config:
+            log.debug(f"Found JSON config at {current} (depth={depth})")
+            return current, json_config
+
+        # Move up one level
+        parent = current.parent
+        if parent == current:  # Reached root
+            break
+        current = parent
+        depth += 1
+
+    log.debug(f"No config found searching from {start_path} (searched {depth} levels)")
+    return None
+
+
 def _extract_stable_identity(marker: str, content: bytes) -> str | None:
     """Extract stable identity fields from marker file content.
 
@@ -253,30 +342,43 @@ def hash_project_markers(path: Path) -> str | None:
     return None
 
 
-def get_project_id(path: str | Path) -> str:
-    """Generate hierarchical project ID using multiple strategies.
+class ProjectIdError(Exception):
+    """Raised when project ID cannot be determined."""
+
+    def __init__(self, path: Path, message: str, suggestion: str):
+        self.path = path
+        self.message = message
+        self.suggestion = suggestion
+        super().__init__(f"{message}\n\nSuggestion: {suggestion}")
+
+
+def get_project_id(path: str | Path, strict: bool = False) -> str:
+    """Generate hierarchical project ID using deterministic strategies.
 
     Tries strategies in order of stability:
-    1. Git remote URL (most stable, cross-machine)
-    2. Config file UUID (.simplemem.json)
-    3. Content hash of project markers
-    4. Resolved absolute path (fallback)
+    1. Git remote URL (most stable, cross-machine) - PREFERRED
+    2. Config file (.simplemem.yaml) - walk up directories
+    3. Content hash of project markers - DEPRECATED, logs warning
+    4. Resolved absolute path - DEPRECATED, logs warning
 
     Args:
         path: Project root path (absolute or relative)
+        strict: If True, raise ProjectIdError instead of falling back to
+                deprecated hash/path strategies. Use strict=True for new code.
 
     Returns:
-        Project ID with format prefix (git:, uuid:, hash:, path:)
+        Project ID with format prefix (git:, config:, hash:, path:)
+
+    Raises:
+        ProjectIdError: If strict=True and no git remote or config found
 
     Examples:
         >>> get_project_id("/repo/myproject")  # with git remote
         'git:github.com/user/myproject'
-        >>> get_project_id("/repo/myproject")  # with .simplemem.json
-        'uuid:550e8400-e29b-41d4-a716-446655440000'
-        >>> get_project_id("/repo/myproject")  # with package.json
-        'hash:a1b2c3d4e5f67890'
-        >>> get_project_id("/repo/myproject")  # fallback
-        'path:/repo/myproject'
+        >>> get_project_id("/repo/myproject")  # with .simplemem.yaml
+        'config:mycompany/myproject'
+        >>> get_project_id("/repo/myproject", strict=True)  # no git/config
+        ProjectIdError: No project ID found. Create .simplemem.yaml...
     """
     resolved_path = Path(path).expanduser().resolve()
 
@@ -285,21 +387,48 @@ def get_project_id(path: str | Path) -> str:
     if git_url:
         return f"git:{git_url}"
 
-    # Strategy 2: Config file UUID
-    config = load_simplemem_config(resolved_path)
-    if config and "project_id" in config:
+    # Strategy 2: Walk up directories to find config file (.simplemem.yaml or .simplemem.json)
+    config_result = find_config_file(resolved_path)
+    if config_result:
+        config_dir, config = config_result
         project_id = config["project_id"]
-        # If already prefixed, use as-is; otherwise add uuid: prefix
-        if not any(project_id.startswith(p) for p in ["git:", "uuid:", "hash:", "path:"]):
-            project_id = f"uuid:{project_id}"
+        # Add config: prefix if not already prefixed
+        if not any(project_id.startswith(p) for p in ["git:", "uuid:", "config:", "hash:", "path:"]):
+            project_id = f"config:{project_id}"
         return project_id
 
-    # Strategy 3: Content hash
+    # --- DEPRECATED FALLBACKS ---
+    # These are kept for backwards compatibility but will be removed.
+    # New code should use strict=True.
+
+    if strict:
+        raise ProjectIdError(
+            path=resolved_path,
+            message=f"No project ID found for: {resolved_path}",
+            suggestion=(
+                "Create a .simplemem.yaml file with:\n\n"
+                "  version: 1\n"
+                f"  project_id: \"{resolved_path.name}\"\n\n"
+                "Or initialize a git repository with a remote."
+            ),
+        )
+
+    # Strategy 3: Content hash (DEPRECATED)
     content_hash = hash_project_markers(resolved_path)
     if content_hash:
+        log.warning(
+            f"Using DEPRECATED hash-based project ID for {resolved_path}. "
+            "Hash IDs are brittle and will be removed in a future version. "
+            "Create .simplemem.yaml or add a git remote."
+        )
         return f"hash:{content_hash}"
 
-    # Strategy 4: Fallback to resolved path
+    # Strategy 4: Fallback to resolved path (DEPRECATED)
+    log.warning(
+        f"Using DEPRECATED path-based project ID for {resolved_path}. "
+        "Path IDs are not portable. "
+        "Create .simplemem.yaml or add a git remote."
+    )
     return f"path:{resolved_path}"
 
 
@@ -310,15 +439,17 @@ def parse_project_id(project_id: str) -> tuple[str, str]:
         project_id: Full project ID with optional prefix
 
     Returns:
-        Tuple of (type, value) where type is git/uuid/hash/path
+        Tuple of (type, value) where type is git/config/uuid/hash/path
 
     Examples:
         >>> parse_project_id("git:github.com/user/repo")
         ('git', 'github.com/user/repo')
+        >>> parse_project_id("config:mycompany/myproject")
+        ('config', 'mycompany/myproject')
         >>> parse_project_id("/Users/dev/project")
         ('path', '/Users/dev/project')
     """
-    for prefix in ["git:", "uuid:", "hash:", "path:"]:
+    for prefix in ["git:", "config:", "uuid:", "hash:", "path:"]:
         if project_id.startswith(prefix):
             return prefix[:-1], project_id[len(prefix):]
 

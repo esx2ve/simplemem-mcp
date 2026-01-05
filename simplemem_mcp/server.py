@@ -561,19 +561,26 @@ async def get_project_id(path: str | None = None) -> dict:
     - When setting up project isolation for memory operations
 
     PROJECT_ID HIERARCHY (most stable first):
-    1. git:github.com/user/repo - From git remote (survives moves/clones)
-    2. uuid:550e8400-... - From .simplemem.json config (explicit control)
-    3. hash:a1b2c3d4... - From project marker files (package.json, etc.)
-    4. path:/Users/... - Absolute path fallback (least stable)
+    1. git:github.com/user/repo - From git remote (survives moves/clones) - PREFERRED
+    2. config:mycompany/myproject - From .simplemem.yaml (explicit control)
+    3. hash:a1b2c3d4... - DEPRECATED (from package.json etc.) - logs warning
+    4. path:/Users/... - DEPRECATED (absolute path fallback) - logs warning
+
+    IMPORTANT: Hash and path-based IDs are deprecated and will be removed.
+    Projects MUST have either a git remote or a .simplemem.yaml config file.
+
+    To create a config file, add .simplemem.yaml to your project root:
+        version: 1
+        project_id: "mycompany/myproject"
 
     EXAMPLES:
         # Get ID for current working directory
         get_project_id()
         # Returns: {"project_id": "git:github.com/user/myproject", "id_type": "git", ...}
 
-        # Get ID for a specific path
+        # Get ID for a project with config file
         get_project_id("~/code/another-project")
-        # Returns: {"project_id": "hash:a1b2c3d4e5f6", "id_type": "hash", ...}
+        # Returns: {"project_id": "config:mycompany/project", "id_type": "config", ...}
 
         # Use the returned project_id with memory tools
         result = get_project_id()
@@ -652,9 +659,11 @@ async def process_trace(
 
     WHEN TO USE:
     - After completing significant work in a session
-    - When user requests indexing of their sessions
-    - To build memory from historical sessions (use discover_sessions first)
+    - When user requests indexing of a SINGLE session
     - As part of regular maintenance to keep memory up-to-date
+
+    FOR MULTIPLE SESSIONS: Use process_trace_batch() instead!
+    It's more efficient and handles concurrency automatically.
 
     WHEN NOT TO USE:
     - For sessions still in progress (wait until complete)
