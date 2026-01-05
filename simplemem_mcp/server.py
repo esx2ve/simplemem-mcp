@@ -141,7 +141,7 @@ def _infer_project_from_session_path(session_path: Path) -> str | None:
         session_path: Path to the session trace file (e.g., ~/.claude/projects/-Users-.../session.jsonl)
 
     Returns:
-        Decoded project path (e.g., /Users/shimon/repo/project) or None
+        Decoded project path with symlinks resolved (e.g., /Users/shimon/repo/project) or None
     """
     try:
         # The parent directory name is the encoded project path
@@ -149,12 +149,15 @@ def _infer_project_from_session_path(session_path: Path) -> str | None:
         decoded_path = _decode_claude_path(encoded_name)
 
         if decoded_path:
-            # Validate the path exists (optional but helps catch decoding errors)
-            if Path(decoded_path).exists():
-                return decoded_path
-            else:
-                # Path doesn't exist - could be stale trace, still return decoded
-                log.debug(f"Decoded path doesn't exist (may be stale): {decoded_path}")
+            # Resolve symlinks to get canonical path (matches get_project_id behavior)
+            # This ensures process_trace() and get_project_id() return consistent paths
+            try:
+                resolved = str(Path(decoded_path).resolve())
+                log.debug(f"Resolved path: {decoded_path} -> {resolved}")
+                return resolved
+            except Exception:
+                # If resolve fails (path doesn't exist on this machine), return decoded as-is
+                log.debug(f"Could not resolve path (may not exist locally): {decoded_path}")
                 return decoded_path
 
         return None

@@ -32,6 +32,13 @@ def _infer_project_from_session_path(session_path: Path) -> str | None:
     try:
         encoded_name = session_path.parent.name
         decoded_path = _decode_claude_path(encoded_name)
+        if decoded_path:
+            # Resolve symlinks to get canonical path (matches get_project_id behavior)
+            try:
+                resolved = str(Path(decoded_path).resolve())
+                return resolved
+            except Exception:
+                return decoded_path
         return decoded_path
     except Exception:
         return None
@@ -103,15 +110,18 @@ class TestInferProjectFromSessionPath:
         """Linux trace file path should yield correct project."""
         trace_path = Path("/home/dev/.claude/projects/-home-dev-work-api/12345.jsonl")
         project = _infer_project_from_session_path(trace_path)
-        assert project == "/home/dev/work/api"
+        # On macOS, /home is a symlink to /System/Volumes/Data/home
+        # So we check it ends with the expected path
+        assert project.endswith("/home/dev/work/api")
 
     def test_infer_handles_invalid_path(self):
-        """Invalid path should return the parent directory name decoded."""
-        # Path object with weird parent
+        """Invalid path should return the resolved parent directory name."""
+        # Path object with weird parent - "some" doesn't start with -, so returned as-is
+        # but still resolved (which may prepend cwd on relative paths)
         trace_path = Path("/some/path.jsonl")
         project = _infer_project_from_session_path(trace_path)
-        # The parent is "some" which doesn't start with -, so returned as-is
-        assert project == "some"
+        # The parent is "some" which doesn't start with -, returned as-is then resolved
+        assert project.endswith("some") or project == "some"
 
 
 class TestProjectIdEdgeCases:
