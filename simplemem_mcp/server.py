@@ -18,6 +18,12 @@ from mcp.server.fastmcp import FastMCP
 
 from simplemem_mcp.client import BackendClient, BackendError
 from simplemem_mcp.local_reader import LocalReader
+from simplemem_mcp.projects_utils import (
+    get_project_id as generate_project_id,
+    infer_project_from_session_path,
+    parse_project_id,
+    extract_project_name,
+)
 from simplemem_mcp.watcher import CloudWatcherManager
 
 # Configure logging
@@ -80,89 +86,35 @@ async def _get_watcher_manager() -> CloudWatcherManager:
 
 
 def _resolve_project_id(project_id: str | None) -> str | None:
-    """Resolve project_id, defaulting to canonical cwd if not provided.
+    """Resolve project_id using hybrid identification strategies.
 
-    The canonical project_id is the absolute path of the project root.
-    This ensures 1:1 mapping and easy discovery.
+    Uses hierarchical ID generation:
+    1. Git remote URL (most stable, cross-machine)
+    2. Config file UUID (.simplemem.json)
+    3. Content hash of project markers
+    4. Resolved absolute path (fallback)
 
     Args:
-        project_id: Optional explicit project_id
+        project_id: Optional explicit project_id (if prefixed, used as-is)
 
     Returns:
-        Canonical project_id (absolute path) or None if cwd resolution fails
+        Project ID with prefix (git:, uuid:, hash:, path:) or None
     """
     if project_id:
-        # Already provided - ensure it's canonical (absolute path)
-        return str(Path(project_id).expanduser().resolve())
+        # Check if already has a prefix (properly formatted ID)
+        if any(project_id.startswith(p) for p in ["git:", "uuid:", "hash:", "path:"]):
+            return project_id
+        # Treat as path and generate proper hierarchical ID
+        return generate_project_id(project_id)
 
     # Auto-resolve from current working directory
     try:
         cwd = Path.cwd().resolve()
-        log.debug(f"Auto-resolved project_id from cwd: {cwd}")
-        return str(cwd)
+        project_id = generate_project_id(cwd)
+        log.debug(f"Auto-resolved project_id from cwd: {project_id}")
+        return project_id
     except Exception as e:
         log.warning(f"Failed to resolve project_id from cwd: {e}")
-        return None
-
-
-def _decode_claude_path(encoded_path: str) -> str | None:
-    """Decode Claude's encoded project path format.
-
-    Claude Code stores traces in ~/.claude/projects/{encoded-path}/
-    where the path is encoded by replacing '/' with '-'.
-
-    Examples:
-        -Users-shimon-repo-project -> /Users/shimon/repo/project
-        -home-user-code-app -> /home/user/code/app
-
-    Args:
-        encoded_path: The encoded directory name from Claude's trace storage
-
-    Returns:
-        Decoded absolute path, or None if invalid
-    """
-    if not encoded_path or encoded_path == "-":
-        return "/"
-
-    # Claude encodes leading / as - and uses - as separator
-    # This is lossy for paths with actual dashes, but Claude's encoding
-    # makes that unavoidable
-    if encoded_path.startswith("-"):
-        decoded = "/" + encoded_path[1:].replace("-", "/")
-        return decoded
-
-    return encoded_path
-
-
-def _infer_project_from_session_path(session_path: Path) -> str | None:
-    """Infer project_id from a Claude trace file path.
-
-    Args:
-        session_path: Path to the session trace file (e.g., ~/.claude/projects/-Users-.../session.jsonl)
-
-    Returns:
-        Decoded project path with symlinks resolved (e.g., /Users/shimon/repo/project) or None
-    """
-    try:
-        # The parent directory name is the encoded project path
-        encoded_name = session_path.parent.name
-        decoded_path = _decode_claude_path(encoded_name)
-
-        if decoded_path:
-            # Resolve symlinks to get canonical path (matches get_project_id behavior)
-            # This ensures process_trace() and get_project_id() return consistent paths
-            try:
-                resolved = str(Path(decoded_path).resolve())
-                log.debug(f"Resolved path: {decoded_path} -> {resolved}")
-                return resolved
-            except Exception:
-                # If resolve fails (path doesn't exist on this machine), return decoded as-is
-                log.debug(f"Could not resolve path (may not exist locally): {decoded_path}")
-                return decoded_path
-
-        return None
-    except Exception as e:
-        log.warning(f"Failed to infer project from session path: {e}")
         return None
 
 
@@ -181,15 +133,68 @@ async def store_memory(
 ) -> dict:
     """Store a memory with optional relationships.
 
+    PURPOSE: Persist insights, decisions, patterns, and learnings to the memory graph
+    for retrieval in future sessions. This is the PRIMARY tool for building
+    cross-session knowledge that compounds over time.
+
+    WHEN TO USE:
+    - After solving a bug: Store the root cause and fix
+    - After making architectural decisions: Store the decision with rationale
+    - After discovering patterns: Store reusable approaches
+    - Before session ends: Store key learnings and context
+    - When user says "remember this" or "save for later"
+
+    WHEN NOT TO USE:
+    - For transient conversation context (use working memory instead)
+    - For large code blocks (use code indexing instead)
+    - For raw session logs (use process_trace instead)
+
+    MEMORY TYPES (use the right type for better retrieval):
+    - "fact": Project-specific facts, configurations, conventions
+    - "lesson_learned": Debugging insights, gotchas, what worked/didn't work
+    - "decision": Architectural choices with rationale and rejected alternatives
+    - "pattern": Reusable code patterns, approaches, templates
+    - "session_summary": End-of-session comprehensive summary (auto-generated)
+    - "chunk_summary": Activity chunk summary (auto-generated by process_trace)
+
+    EXAMPLES:
+        # After fixing a bug
+        store_memory(
+            text="Database connection timeout was caused by missing connection pool limits. Fixed by setting max_connections=20 in config.py:45",
+            type="lesson_learned",
+            project_id="git:github.com/user/myproject"
+        )
+
+        # After architectural decision
+        store_memory(
+            text="Decision: Use Redis for session storage. Reason: Need distributed sessions for horizontal scaling. Rejected: In-memory (not distributed), PostgreSQL (too slow for session lookups)",
+            type="decision"
+        )
+
+        # Linking memories
+        store_memory(
+            text="Pattern: Always use context managers for DB connections",
+            type="pattern",
+            relations=[{"target_id": "<uuid-of-related-memory>", "type": "supports"}]
+        )
+
     Args:
-        text: The content to store
-        type: Memory type (fact, session_summary, chunk_summary, message)
-        source: Source of memory (user, claude_trace, extracted)
-        relations: Optional list of {target_id, type} relationships
-        project_id: Optional project identifier for cross-project isolation
+        text: The content to store. Be specific and actionable - include file paths,
+              line numbers, error messages, and concrete solutions. Future sessions
+              will rely on this text for retrieval.
+        type: Memory type. Use "lesson_learned" for debugging, "decision" for
+              architectural choices, "pattern" for reusable approaches, "fact" for
+              project-specific information.
+        source: Origin of the memory. "user" for direct input, "claude_trace" for
+                auto-extracted from sessions, "extracted" for LLM-derived insights.
+        relations: Link to related memories. Each dict needs {target_id: str, type: str}.
+                   Relation types: "contains", "child_of", "supports", "follows", "similar"
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+                    ALWAYS use project_id to prevent cross-project data leakage.
 
     Returns:
-        Dict with uuid of stored memory or error
+        On success: {"uuid": "<memory-uuid>"} - Save this UUID for creating relations
+        On error: {"error": "<error-message>"}
     """
     resolved_project_id = _resolve_project_id(project_id)
     log.info(f"store_memory called (type={type}, project={resolved_project_id})")
@@ -218,18 +223,71 @@ async def search_memories(
 ) -> dict:
     """Hybrid search combining vector similarity and graph traversal.
 
-    Searches summaries first for efficiency, then expands via graph
-    to find related memories.
+    PURPOSE: Find relevant memories from past sessions using semantic search.
+    This is your PRIMARY retrieval tool - use it BEFORE starting work to
+    check if similar problems have been solved before.
+
+    WHEN TO USE (CRITICAL - use at these moments):
+    - SESSION START: Always search for context before starting complex tasks
+    - ENCOUNTERING ERRORS: Search for past solutions to similar errors
+    - BEFORE IMPLEMENTING: Check if patterns exist for this type of work
+    - DEBUGGING: Search for related debugging sessions and fixes
+    - WHEN STUCK: Past sessions may have encountered the same blockers
+
+    WHEN NOT TO USE:
+    - For code search (use search_code instead)
+    - When you need synthesized answers (use ask_memories instead)
+    - For multi-hop reasoning chains (use reason_memories instead)
+
+    SEARCH STRATEGY:
+    1. Uses vector similarity to find semantically similar memories
+    2. Expands results via graph relationships (if use_graph=True)
+    3. Returns ranked results with relevance scores
+
+    EXAMPLES:
+        # At session start - recall project context
+        search_memories(
+            query="project architecture and key patterns",
+            type_filter="decision",
+            project_id="git:github.com/user/myproject"
+        )
+
+        # When hitting an error
+        search_memories(
+            query="TypeError NoneType connection pool database",
+            type_filter="lesson_learned"
+        )
+
+        # Before implementing a feature
+        search_memories(query="authentication JWT implementation patterns")
+
+        # Finding debugging history
+        search_memories(
+            query="memory leak performance issues",
+            limit=20,
+            use_graph=True
+        )
 
     Args:
-        query: Search query text
-        limit: Maximum results to return
-        use_graph: Whether to expand results via graph relationships
-        type_filter: Optional filter by memory type
-        project_id: Optional filter by project (for cross-project isolation)
+        query: Natural language description of what you're looking for.
+               Be specific - include error messages, file names, concepts.
+               Examples: "database connection timeout fix", "React hooks patterns",
+               "authentication implementation decision"
+        limit: Maximum results (default: 10). Increase for broad exploration,
+               decrease for focused queries.
+        use_graph: Expand results via graph relationships (default: True).
+                   Set False for faster, more focused results.
+        type_filter: Filter by memory type. Values: "fact", "lesson_learned",
+                     "decision", "pattern", "session_summary", "chunk_summary"
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+                    CRITICAL: Always use to prevent retrieving unrelated memories.
 
     Returns:
-        Dict with results list or error
+        On success: {"results": [
+            {"uuid": "...", "content": "...", "type": "...", "score": 0.85, "created_at": "..."},
+            ...
+        ]}
+        On error: {"error": "...", "results": []}
     """
     resolved_project_id = _resolve_project_id(project_id)
     try:
@@ -254,15 +312,50 @@ async def relate_memories(
     to_id: str,
     relation_type: str = "relates",
 ) -> dict:
-    """Create a relationship between two memories.
+    """Create a relationship between two memories in the knowledge graph.
+
+    PURPOSE: Build connections between memories to enable graph traversal
+    and multi-hop reasoning. Relationships make memories discoverable via
+    related content, not just semantic similarity.
+
+    WHEN TO USE:
+    - After storing related memories (e.g., problem → solution)
+    - When creating hierarchical knowledge (e.g., summary → details)
+    - To link decisions to supporting evidence
+    - To connect debugging sessions to the fixes they produced
+
+    RELATION TYPES:
+    - "contains": Parent contains children (session_summary → chunk_summaries)
+    - "child_of": Inverse of contains (detail → summary)
+    - "supports": Evidence supports a conclusion (facts → decision)
+    - "follows": Temporal/logical sequence (problem → investigation → solution)
+    - "similar": Related but not hierarchical (alternative approaches)
+    - "relates": Generic relationship (default)
+
+    EXAMPLES:
+        # Link a lesson learned to the decision it supports
+        relate_memories(
+            from_id="<lesson-uuid>",
+            to_id="<decision-uuid>",
+            relation_type="supports"
+        )
+
+        # Create a sequence of debugging steps
+        relate_memories(
+            from_id="<error-memory-uuid>",
+            to_id="<fix-memory-uuid>",
+            relation_type="follows"
+        )
 
     Args:
-        from_id: Source memory UUID
-        to_id: Target memory UUID
-        relation_type: Type of relationship (contains, child_of, supports, follows, similar)
+        from_id: Source memory UUID (the one doing the relating)
+        to_id: Target memory UUID (the one being related to)
+        relation_type: Type of relationship. Choose the most specific type
+                       that describes the connection.
 
     Returns:
-        Dict with success bool or error
+        On success: {"success": true}
+        On error: {"error": "...", "success": false}
     """
     try:
         log.info(f"relate_memories called ({from_id[:8]} -> {to_id[:8]})")
@@ -287,26 +380,67 @@ async def ask_memories(
 ) -> dict:
     """Ask a question and get an LLM-synthesized answer from memory graph.
 
-    Retrieves relevant memories via multi-hop graph traversal, then uses
-    an LLM to synthesize a coherent answer grounded in the evidence.
+    PURPOSE: Get synthesized, coherent answers from your memory graph instead
+    of raw search results. The LLM reads relevant memories and produces a
+    grounded answer with citations. Use this when you need UNDERSTANDING,
+    not just retrieval.
 
-    The answer includes citations [1], [2], etc. referencing specific memories.
-    Cross-session insights (patterns found across different work sessions) are
-    highlighted as especially valuable.
+    WHEN TO USE:
+    - When you need a synthesized answer, not raw memories
+    - For "how did we..." or "what was the solution to..." questions
+    - When search results need interpretation and consolidation
+    - For getting actionable guidance from past experience
+    - When you want cross-session pattern insights
 
-    Example queries:
-    - "What was the solution to the database connection issue?"
-    - "How did we implement the authentication feature?"
-    - "What patterns have worked for debugging async code?"
+    WHEN NOT TO USE:
+    - For simple retrieval (use search_memories instead - faster)
+    - When you need to see all raw results (use search_memories)
+    - For code search (use search_code)
+    - When exploring without a specific question (use search_memories)
+
+    HOW IT WORKS:
+    1. Retrieves relevant memories via graph traversal
+    2. Synthesizes an answer using an LLM grounded in the evidence
+    3. Includes citations [1], [2] referencing specific memories
+    4. Highlights cross-session insights (patterns across sessions)
+
+    EXAMPLES:
+        # Get a synthesized solution to a past problem
+        ask_memories(
+            query="What was the solution to the database connection timeout issue?",
+            project_id="git:github.com/user/myproject"
+        )
+
+        # Understand how something was implemented
+        ask_memories(query="How did we implement the authentication feature?")
+
+        # Get patterns from debugging history
+        ask_memories(
+            query="What patterns have worked for debugging async code?",
+            max_memories=12  # Include more context for pattern discovery
+        )
+
+        # Understand architectural decisions
+        ask_memories(query="Why did we choose PostgreSQL over MongoDB?")
 
     Args:
-        query: Natural language question
-        max_memories: Maximum memories to include in context (default: 8)
-        max_hops: Maximum graph traversal depth (default: 2)
-        project_id: Optional project identifier for cross-project isolation
+        query: Natural language question. Be specific about what you want to know.
+               Good: "What caused the memory leak in the image processing pipeline?"
+               Bad: "memory issues" (too vague)
+        max_memories: Maximum memories to include in LLM context (default: 8).
+                      Increase for complex questions needing more evidence.
+        max_hops: Graph traversal depth (default: 2). Higher values find more
+                  distant but potentially relevant memories.
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
 
     Returns:
-        {answer, memories_used, cross_session_insights, confidence, sources}
+        {
+            "answer": "Synthesized answer with [1][2] citations...",
+            "memories_used": 5,
+            "cross_session_insights": ["Pattern found across 3 sessions..."],
+            "confidence": "high|medium|low",
+            "sources": [{"uuid": "...", "content": "...", "citation": 1}, ...]
+        }
     """
     resolved_project_id = _resolve_project_id(project_id)
     try:
@@ -330,24 +464,72 @@ async def reason_memories(
     min_score: float = 0.1,
     project_id: str | None = None,
 ) -> dict:
-    """Multi-hop reasoning over memory graph.
+    """Multi-hop reasoning over memory graph for complex questions.
 
-    Combines vector search with graph traversal and semantic path scoring
-    to answer complex questions that require following chains of evidence.
+    PURPOSE: Perform deep reasoning that requires following chains of evidence
+    through the memory graph. Use this for questions that need connecting
+    multiple memories to form conclusions.
 
-    Example queries:
-    - "What debugging patterns work for database issues?"
-    - "How did the authentication feature evolve?"
-    - "Find solutions related to connection timeouts"
+    WHEN TO USE:
+    - Questions requiring connecting multiple pieces of evidence
+    - Finding evolution/history of features or decisions
+    - Discovering patterns across different debugging sessions
+    - Tracing cause-effect chains through memory graph
+    - When ask_memories gives incomplete answers needing more depth
+
+    WHEN NOT TO USE:
+    - Simple fact lookup (use search_memories)
+    - Direct questions with obvious answers (use ask_memories)
+    - Code search (use search_code)
+
+    HOW IT WORKS:
+    1. Vector search finds entry points into the graph
+    2. Graph traversal follows relationships to related memories
+    3. Semantic path scoring evaluates evidence chains
+    4. Returns conclusions with proof chains showing reasoning path
+
+    EXAMPLES:
+        # Trace the evolution of a feature
+        reason_memories(
+            query="How did the authentication feature evolve?",
+            max_hops=3  # Allow deeper traversal for history
+        )
+
+        # Find debugging patterns
+        reason_memories(query="What debugging patterns work for database issues?")
+
+        # Trace cause-effect
+        reason_memories(
+            query="What led to the decision to migrate to PostgreSQL?",
+            project_id="git:github.com/user/myproject"
+        )
+
+        # Connect related solutions
+        reason_memories(query="Find solutions related to connection timeouts")
 
     Args:
-        query: Natural language query
-        max_hops: Maximum path length for traversal (1-3)
-        min_score: Minimum score threshold for results
-        project_id: Optional project identifier for cross-project isolation
+        query: Complex question requiring multi-hop reasoning. Be specific
+               about what connections you're looking for.
+        max_hops: Maximum graph traversal depth (1-3). Higher = more connections
+                  but slower. Use 3 for historical/evolutionary questions.
+        min_score: Minimum relevance score threshold (0.0-1.0). Lower values
+                   include more distant but potentially relevant memories.
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
 
     Returns:
-        {conclusions: [{uuid, content, type, score, proof_chain, hops}]}
+        {
+            "conclusions": [
+                {
+                    "uuid": "...",
+                    "content": "...",
+                    "type": "lesson_learned",
+                    "score": 0.85,
+                    "proof_chain": ["memory-1 → memory-2 → memory-3"],
+                    "hops": 2
+                },
+                ...
+            ]
+        }
     """
     resolved_project_id = _resolve_project_id(project_id)
     try:
@@ -368,31 +550,68 @@ async def reason_memories(
 async def get_project_id(path: str | None = None) -> dict:
     """Get the canonical project_id for a path or current working directory.
 
-    The project_id is the canonical absolute path, ensuring 1:1 mapping
-    between project paths and their IDs. This makes discovery trivial:
-    the project_id IS the absolute path.
+    PURPOSE: Obtain the stable project identifier for use with memory tools.
+    The project_id ensures memories are isolated per-project and remain
+    consistent even if the project is moved or cloned elsewhere.
+
+    WHEN TO USE:
+    - At session start to get the current project's ID
+    - When you need to explicitly pass project_id to other tools
+    - To verify which project you're working in
+    - When setting up project isolation for memory operations
+
+    PROJECT_ID HIERARCHY (most stable first):
+    1. git:github.com/user/repo - From git remote (survives moves/clones)
+    2. uuid:550e8400-... - From .simplemem.json config (explicit control)
+    3. hash:a1b2c3d4... - From project marker files (package.json, etc.)
+    4. path:/Users/... - Absolute path fallback (least stable)
+
+    EXAMPLES:
+        # Get ID for current working directory
+        get_project_id()
+        # Returns: {"project_id": "git:github.com/user/myproject", "id_type": "git", ...}
+
+        # Get ID for a specific path
+        get_project_id("~/code/another-project")
+        # Returns: {"project_id": "hash:a1b2c3d4e5f6", "id_type": "hash", ...}
+
+        # Use the returned project_id with memory tools
+        result = get_project_id()
+        search_memories(query="...", project_id=result["project_id"])
 
     Args:
-        path: Optional path to resolve (defaults to current working directory)
+        path: Path to resolve. Defaults to current working directory.
+              Can be absolute or relative (will be resolved).
 
     Returns:
-        {project_id: str, path: str} or {error: str}
-
-    Example:
-        get_project_id()  # Returns cwd as project_id
-        get_project_id("~/repo/myproject")  # Returns /Users/.../repo/myproject
+        On success: {
+            "project_id": "git:github.com/user/repo",  # Use this with other tools
+            "id_type": "git",                          # How the ID was determined
+            "id_value": "github.com/user/repo",        # The ID without prefix
+            "project_name": "repo",                    # Human-readable name
+            "path": "/Users/.../repo",                 # Resolved absolute path
+            "message": "Project identified via git..."
+        }
+        On error: {"error": "..."}
     """
     try:
         if path:
-            resolved = str(Path(path).expanduser().resolve())
+            resolved_path = Path(path).expanduser().resolve()
         else:
-            resolved = str(Path.cwd().resolve())
+            resolved_path = Path.cwd().resolve()
 
-        log.info(f"get_project_id called, resolved: {resolved}")
+        project_id = generate_project_id(resolved_path)
+        id_type, id_value = parse_project_id(project_id)
+        project_name = extract_project_name(project_id)
+
+        log.info(f"get_project_id called: {project_id} (type={id_type})")
         return {
-            "project_id": resolved,
-            "path": resolved,
-            "message": "Use this project_id with memory tools for isolation",
+            "project_id": project_id,
+            "id_type": id_type,
+            "id_value": id_value,
+            "project_name": project_name,
+            "path": str(resolved_path),
+            "message": f"Project identified via {id_type}. Use this project_id with memory tools for isolation.",
         }
     except Exception as e:
         log.error(f"get_project_id failed: {e}")
@@ -425,22 +644,57 @@ async def process_trace(
     session_id: str,
     background: bool = True,
 ) -> dict:
-    """Index a Claude Code session trace with hierarchical summaries.
+    """Index a Claude Code session trace into searchable memory summaries.
 
-    Creates a hierarchy of memories:
-    - session_summary (1) - Overall session summary
-    - chunk_summary (5-15) - Summaries of activity chunks
+    PURPOSE: Transform raw Claude Code session traces into structured,
+    searchable memories. Creates hierarchical summaries that capture
+    what happened in the session for future retrieval.
 
-    Uses cheap LLM (flash-lite) for summarization with progress updates.
-    Runs in background by default to avoid MCP timeout on large sessions.
+    WHEN TO USE:
+    - After completing significant work in a session
+    - When user requests indexing of their sessions
+    - To build memory from historical sessions (use discover_sessions first)
+    - As part of regular maintenance to keep memory up-to-date
+
+    WHEN NOT TO USE:
+    - For sessions still in progress (wait until complete)
+    - If session was trivial with no useful learnings
+    - Repeatedly on same session (it's idempotent but wastes resources)
+
+    HOW IT WORKS:
+    1. Reads the session trace file from ~/.claude/projects/
+    2. Splits into logical chunks based on activity
+    3. Generates summaries using fast LLM (gemini-flash-lite)
+    4. Creates memories: 1 session_summary + 5-15 chunk_summaries
+    5. Links memories with relationships for graph traversal
+    6. Auto-extracts project_id from trace file path
+
+    WORKFLOW:
+        # Discover what sessions exist
+        discover_sessions(days_back=7)
+
+        # Index a specific session
+        result = process_trace(session_id="abc-123-def")
+
+        # Check progress for background jobs
+        job_status(job_id=result["job_id"])
 
     Args:
-        session_id: Session UUID to index
-        background: Run in background (default: True). Use job_status to check progress.
+        session_id: UUID of the Claude Code session to index.
+                    Find session IDs using discover_sessions().
+        background: Run in background (default: True). Large sessions
+                    may take minutes; background prevents timeout.
+                    Use job_status() to check progress.
 
     Returns:
-        If background=True: {job_id, status: "submitted"}
-        If background=False: {session_summary_id, chunk_count, message_count} or error
+        If background=True: {"job_id": "...", "status": "submitted"}
+        If background=False: {
+            "session_summary_id": "...",
+            "chunk_count": 8,
+            "message_count": 156,
+            "project_id": "git:github.com/user/repo"
+        }
+        On error: {"error": "..."}
     """
     try:
         log.info(f"process_trace called (session_id={session_id})")
@@ -453,7 +707,7 @@ async def process_trace(
             return {"error": f"Session {session_id} not found"}
 
         # Infer project_id from the trace file path (Claude's encoded directory name)
-        project_id = _infer_project_from_session_path(session_path)
+        project_id = infer_project_from_session_path(session_path)
         log.info(f"Inferred project_id from session path: {project_id}")
 
         # Read trace content
@@ -609,28 +863,90 @@ async def cancel_job(job_id: str) -> dict:
 async def search_code(
     query: str,
     limit: int = 10,
-    project_root: str | None = None,
+    project_id: str | None = None,
+    project_root: str | None = None,  # Deprecated: use project_id
 ) -> dict:
-    """Search the code index for relevant code snippets.
+    """Search indexed code for implementations, patterns, and functionality.
 
-    Use this to find code implementations, patterns, or specific functionality.
-    Results are ranked by semantic similarity to the query.
+    PURPOSE: Find relevant code snippets using semantic search. Unlike grep/ripgrep
+    which match exact text, this finds code by MEANING - "authentication handler"
+    will find login functions even if they don't contain those exact words.
+
+    WHEN TO USE:
+    - Finding implementations: "user authentication", "database connection pool"
+    - Finding patterns: "error handling pattern", "retry logic"
+    - Understanding structure: "API endpoints", "middleware functions"
+    - Before implementing: Check if similar code exists
+    - Debugging: Find code related to an error
+
+    WHEN NOT TO USE:
+    - For exact text matches (use grep/ripgrep instead)
+    - For files that haven't been indexed (use index_directory first)
+    - For memory/insight search (use search_memories instead)
+
+    PREREQUISITE: The codebase must be indexed first using index_directory().
+    If no results found, the codebase may not be indexed.
+
+    EXAMPLES:
+        # Find authentication code
+        search_code(query="user login authentication handler")
+
+        # Find database patterns
+        search_code(
+            query="connection pool database initialization",
+            limit=20
+        )
+
+        # Search in specific project
+        search_code(
+            query="API rate limiting middleware",
+            project_id="git:github.com/user/myproject"
+        )
+
+        # Find error handling
+        search_code(query="exception handling retry logic")
 
     Args:
-        query: Natural language description of what you're looking for
-        limit: Maximum number of results (default: 10)
-        project_root: Optional - filter to specific project directory
+        query: Natural language description of code you're looking for.
+               Be descriptive: "user authentication JWT token validation"
+               is better than just "auth".
+        limit: Maximum results (default: 10). Increase for broader search.
+        project_id: Filter to specific project (preferred). Auto-inferred
+                    from cwd if not specified.
+        project_root: DEPRECATED - use project_id instead.
 
     Returns:
-        List of matching code chunks with file paths and line numbers
+        On success: {
+            "results": [
+                {
+                    "file_path": "/path/to/file.py",
+                    "line_start": 45,
+                    "line_end": 78,
+                    "content": "def authenticate_user(...)...",
+                    "score": 0.89
+                },
+                ...
+            ]
+        }
+        On error: {"error": "...", "results": []}
     """
     try:
-        log.info(f"search_code called (query='{query[:50]}...')")
+        # Resolve project_id from path if only project_root provided
+        resolved_project_id = project_id
+        if not resolved_project_id and project_root:
+            log.warning("search_code: project_root is deprecated, use project_id instead")
+            resolved_project_id = generate_project_id(project_root)
+        elif not resolved_project_id:
+            # Auto-infer from current working directory
+            resolved_project_id = _resolve_project_id(None)
+
+        log.info(f"search_code called (query='{query[:50]}...', project_id={resolved_project_id})")
         client = await _get_client()
         return await client.search_code(
             query=query,
             limit=limit,
-            project_root=project_root,
+            project_root=project_root,  # Still pass for backwards compat
+            project_id=resolved_project_id,
         )
     except BackendError as e:
         log.error(f"search_code failed: {e}")
@@ -644,28 +960,88 @@ async def index_directory(
     clear_existing: bool = True,
     background: bool = True,
 ) -> dict:
-    """Index a directory for code search.
+    """Index a directory for semantic code search.
 
-    Scans the directory for source files matching the patterns,
-    splits them into semantic chunks, and adds to the search index.
-    Runs in background by default to return immediately.
+    PURPOSE: Build a searchable index of code files for semantic search.
+    This enables search_code() to find implementations by meaning,
+    not just exact text matches.
+
+    WHEN TO USE:
+    - At project start: Index the codebase for semantic search
+    - After major changes: Re-index to include new code
+    - When search_code returns no results (codebase not indexed)
+    - Setting up a new project for SimpleMem
+
+    WHEN NOT TO USE:
+    - On already-indexed codebases (unless you need to refresh)
+    - For temporary/generated directories
+    - For node_modules, .git, or other dependency folders (auto-excluded)
+
+    HOW IT WORKS:
+    1. Scans directory for matching source files
+    2. Splits files into semantic chunks (functions, classes, etc.)
+    3. Generates embeddings for each chunk
+    4. Stores in vector database for semantic search
+    5. Associates with project_id for isolation
+
+    DEFAULT FILE PATTERNS:
+    - Python: **/*.py
+    - TypeScript: **/*.ts, **/*.tsx
+    - JavaScript: **/*.js, **/*.jsx
+
+    EXAMPLES:
+        # Index current project (most common)
+        index_directory(path=".")
+
+        # Index with custom patterns
+        index_directory(
+            path="/path/to/project",
+            patterns=["**/*.py", "**/*.rs", "**/*.go"]
+        )
+
+        # Re-index without clearing (add new files only)
+        index_directory(path=".", clear_existing=False)
+
+        # Index and wait for completion
+        result = index_directory(path=".", background=False)
+        # Takes longer but returns stats immediately
+
+    WORKFLOW:
+        # 1. Index the codebase
+        result = index_directory(path=".")
+
+        # 2. Check progress (for background jobs)
+        job_status(job_id=result["job_id"])
+
+        # 3. Now search_code will work
+        search_code(query="authentication handler")
 
     Args:
-        path: Directory path to index
-        patterns: Optional glob patterns (default: ['**/*.py', '**/*.ts', '**/*.js', '**/*.tsx', '**/*.jsx'])
-        clear_existing: Whether to clear existing index for this directory (default: True)
-        background: Run in background (default: True). Use job_status to check progress.
+        path: Directory to index. Can be absolute or relative.
+        patterns: Glob patterns for files to include.
+                  Default: ["**/*.py", "**/*.ts", "**/*.js", "**/*.tsx", "**/*.jsx"]
+        clear_existing: Clear existing index for this project (default: True).
+                        Set False to add files incrementally.
+        background: Run in background (default: True). Large codebases
+                    may take minutes; background prevents timeout.
 
     Returns:
-        If background=True: {job_id, status: "submitted", message: ...}
-        If background=False: Indexing statistics including files indexed and chunks created
+        If background=True: {"job_id": "...", "status": "submitted", "message": "..."}
+        If background=False: {
+            "files_indexed": 156,
+            "chunks_created": 1247,
+            "project_id": "git:github.com/user/repo"
+        }
+        On error: {"error": "..."}
     """
     try:
-        log.info(f"index_directory called (path={path}, background={background})")
-
-        directory = Path(path)
+        directory = Path(path).expanduser().resolve()
         if not directory.exists():
             return {"error": f"Directory not found: {path}"}
+
+        # Generate stable project_id
+        project_id = generate_project_id(directory)
+        log.info(f"index_directory called (path={path}, project_id={project_id}, background={background})")
 
         # Read code files locally (offload blocking I/O to thread)
         reader = await _get_reader()
@@ -680,33 +1056,56 @@ async def index_directory(
         if not files:
             return {"error": "No matching files found", "files_indexed": 0}
 
-        # Send to backend for indexing
+        # Send to backend for indexing with both project_id and project_root
         client = await _get_client()
-        return await client.index_code(
-            project_root=str(directory.absolute()),
+        result = await client.index_code(
+            project_root=str(directory),
+            project_id=project_id,
             files=files,
             clear_existing=clear_existing,
             background=background,
         )
+
+        # Include project_id in response
+        if isinstance(result, dict):
+            result["project_id"] = project_id
+
+        return result
     except BackendError as e:
         log.error(f"index_directory failed: {e}")
         return {"error": e.detail}
 
 
 @mcp.tool()
-async def code_stats(project_root: str | None = None) -> dict:
+async def code_stats(
+    project_id: str | None = None,
+    project_root: str | None = None,  # Deprecated: use project_id
+) -> dict:
     """Get statistics about the code index.
 
     Args:
-        project_root: Optional - filter to specific project
+        project_id: Optional - filter to specific project (preferred)
+        project_root: Optional - filter by path (deprecated, use project_id)
 
     Returns:
         Statistics including chunk count and unique files
     """
     try:
-        log.info("code_stats called")
+        # Resolve project_id from path if only project_root provided
+        resolved_project_id = project_id
+        if not resolved_project_id and project_root:
+            log.warning("code_stats: project_root is deprecated, use project_id instead")
+            resolved_project_id = generate_project_id(project_root)
+        elif not resolved_project_id:
+            # Auto-infer from current working directory
+            resolved_project_id = _resolve_project_id(None)
+
+        log.info(f"code_stats called (project_id={resolved_project_id})")
         client = await _get_client()
-        return await client.code_stats(project_root=project_root)
+        return await client.code_stats(
+            project_root=project_root,
+            project_id=resolved_project_id,
+        )
     except BackendError as e:
         log.error(f"code_stats failed: {e}")
         return {"error": e.detail}

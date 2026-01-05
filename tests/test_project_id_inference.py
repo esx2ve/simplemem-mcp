@@ -250,8 +250,9 @@ class TestProcessTraceProjectIdFlow:
                         background=True,
                     )
 
-            # Verify client was called with correct project_id
+            # Verify client was called with correct project_id (now prefixed)
             mock_client.process_trace.assert_called_once()
             call_kwargs = mock_client.process_trace.call_args.kwargs
-            assert call_kwargs["project_id"] == "/Users/shimon/repo/simplemem"
+            # New format uses path: prefix for decoded paths that don't exist locally
+            assert call_kwargs["project_id"] == "path:/Users/shimon/repo/simplemem"
             assert call_kwargs["session_id"] == session_id
