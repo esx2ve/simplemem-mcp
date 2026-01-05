@@ -272,7 +272,7 @@ class BackendClient:
 
     async def index_code(
         self,
-        project_root: str,
+        project_id: str,
         files: list[dict],
         clear_existing: bool = True,
         background: bool = True,
@@ -280,7 +280,7 @@ class BackendClient:
         """Index code files via backend API.
 
         Args:
-            project_root: Project root path for identification
+            project_id: Project identifier for isolation
             files: List of {path, content} dicts
             clear_existing: Clear existing index for this project
             background: Run in background (default: True). Returns job_id immediately.
@@ -300,14 +300,14 @@ class BackendClient:
                 "compressed": was_compressed,
             })
         data = {
-            "project_root": project_root,
+            "project_id": project_id,
             "files": compressed_files,
             "clear_existing": clear_existing,
             "background": background,
         }
         return await self._request("POST", "/api/v1/code/index", json_data=data)
 
-    async def update_code(self, project_root: str, updates: list[dict]) -> dict:
+    async def update_code(self, project_id: str, updates: list[dict]) -> dict:
         """Incrementally update code index via backend API."""
         compressed_updates = []
         for update in updates:
@@ -330,23 +330,23 @@ class BackendClient:
                     "content": None,
                     "compressed": False,
                 })
-        data = {"project_root": project_root, "updates": compressed_updates}
+        data = {"project_id": project_id, "updates": compressed_updates}
         return await self._request("POST", "/api/v1/code/update", json_data=data)
 
     async def search_code(
-        self, query: str, limit: int = 10, project_root: str | None = None
+        self, query: str, limit: int = 10, project_id: str | None = None
     ) -> dict:
         """Search code via backend API."""
         data = {"query": query, "limit": limit}
-        if project_root:
-            data["project_root"] = project_root
+        if project_id:
+            data["project_id"] = project_id
         return await self._request("POST", "/api/v1/code/search", json_data=data)
 
-    async def code_stats(self, project_root: str | None = None) -> dict:
+    async def code_stats(self, project_id: str | None = None) -> dict:
         """Get code index statistics."""
         params = {}
-        if project_root:
-            params["project_root"] = project_root
+        if project_id:
+            params["project_id"] = project_id
         return await self._request("GET", "/api/v1/code/stats", params=params)
 
     async def update_code_index_status(

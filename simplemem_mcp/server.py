@@ -945,7 +945,6 @@ async def search_code(
         return await client.search_code(
             query=query,
             limit=limit,
-            project_root=project_root,  # Still pass for backwards compat
             project_id=resolved_project_id,
         )
     except BackendError as e:
@@ -1056,10 +1055,9 @@ async def index_directory(
         if not files:
             return {"error": "No matching files found", "files_indexed": 0}
 
-        # Send to backend for indexing with both project_id and project_root
+        # Send to backend for indexing
         client = await _get_client()
         result = await client.index_code(
-            project_root=str(directory),
             project_id=project_id,
             files=files,
             clear_existing=clear_existing,
@@ -1102,10 +1100,7 @@ async def code_stats(
 
         log.info(f"code_stats called (project_id={resolved_project_id})")
         client = await _get_client()
-        return await client.code_stats(
-            project_root=project_root,
-            project_id=resolved_project_id,
-        )
+        return await client.code_stats(project_id=resolved_project_id)
     except BackendError as e:
         log.error(f"code_stats failed: {e}")
         return {"error": e.detail}

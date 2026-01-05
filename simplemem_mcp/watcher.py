@@ -17,6 +17,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from simplemem_mcp import DEFAULT_BACKEND_URL
+from simplemem_mcp.projects_utils import get_project_id as generate_project_id
 
 if TYPE_CHECKING:
     from simplemem_mcp.client import BackendClient
@@ -332,10 +333,12 @@ class CloudWatcherWorker(threading.Thread):
             # This actually executes the coroutine (unlike run_coroutine_threadsafe
             # which requires the loop to be running separately).
             # Use the worker's own BackendClient to avoid cross-loop issues.
-            log.debug(f"Sending {len(updates)} updates to {self._worker_client.base_url}/api/v1/code/update")
+            # Generate canonical project_id to match indexing
+            project_id = generate_project_id(self.project_root)
+            log.debug(f"Sending {len(updates)} updates for project_id={project_id}")
             result = self._loop.run_until_complete(
                 self._worker_client.update_code(
-                    project_root=str(self.project_root),
+                    project_id=project_id,
                     updates=updates,
                 )
             )
