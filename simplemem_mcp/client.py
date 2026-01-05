@@ -349,6 +349,20 @@ class BackendClient:
             params["project_id"] = project_id
         return await self._request("GET", "/api/v1/code/stats", params=params)
 
+    async def code_related_memories(
+        self, chunk_uuid: str, limit: int = 10
+    ) -> dict:
+        """Find memories related to a code chunk via shared entities."""
+        data = {"chunk_uuid": chunk_uuid, "limit": limit}
+        return await self._request("POST", "/api/v1/code/related-memories", json_data=data)
+
+    async def memory_related_code(
+        self, memory_uuid: str, limit: int = 10
+    ) -> dict:
+        """Find code chunks related to a memory via shared entities."""
+        data = {"memory_uuid": memory_uuid, "limit": limit}
+        return await self._request("POST", "/api/v1/code/related-code", json_data=data)
+
     async def update_code_index_status(
         self,
         status: str | None = None,

@@ -1106,6 +1106,106 @@ async def code_stats(
         return {"error": e.detail}
 
 
+@mcp.tool()
+async def code_related_memories(
+    chunk_uuid: str,
+    limit: int = 10,
+) -> dict:
+    """Find memories related to a code chunk via shared entities.
+
+    PURPOSE: Bridge between code and memories - discover debugging sessions,
+    decisions, or patterns related to specific code snippets.
+
+    WHEN TO USE:
+    - After search_code returns results, explore related memories
+    - Understanding context/history behind code changes
+    - Finding debugging insights for specific functions/classes
+    - Connecting implementation to architectural decisions
+
+    HOW IT WORKS:
+    Uses the entity graph to find memories that reference the same entities
+    (files, functions, modules) as the given code chunk.
+
+    EXAMPLES:
+        # After finding authentication code
+        results = search_code(query="user login handler")
+        chunk_uuid = results["results"][0]["uuid"]
+        related = code_related_memories(chunk_uuid=chunk_uuid)
+        # Returns: debugging sessions, decisions, patterns mentioning this code
+
+    Args:
+        chunk_uuid: UUID of the code chunk (from search_code results)
+        limit: Maximum memories to return (default: 10)
+
+    Returns:
+        {
+            "chunk_uuid": "...",
+            "related_memories": [...],
+            "count": 5
+        }
+    """
+    try:
+        log.info(f"code_related_memories called (chunk={chunk_uuid[:8]}...)")
+        client = await _get_client()
+        return await client.code_related_memories(
+            chunk_uuid=chunk_uuid,
+            limit=limit,
+        )
+    except BackendError as e:
+        log.error(f"code_related_memories failed: {e}")
+        return {"error": e.detail, "related_memories": [], "count": 0}
+
+
+@mcp.tool()
+async def memory_related_code(
+    memory_uuid: str,
+    limit: int = 10,
+) -> dict:
+    """Find code chunks related to a memory via shared entities.
+
+    PURPOSE: Bridge from memories to code - find implementations mentioned
+    in debugging sessions, decisions, or patterns.
+
+    WHEN TO USE:
+    - After search_memories finds relevant insights, locate the code
+    - Finding implementations mentioned in architectural decisions
+    - Navigating from a debugging session to the actual code
+    - Understanding what code a lesson_learned applies to
+
+    HOW IT WORKS:
+    Uses the entity graph to find code chunks that reference the same entities
+    (files, functions, modules) as the given memory.
+
+    EXAMPLES:
+        # After finding a debugging insight
+        results = search_memories(query="connection timeout fix")
+        memory_uuid = results["results"][0]["uuid"]
+        related = memory_related_code(memory_uuid=memory_uuid)
+        # Returns: code chunks where the fix was applied
+
+    Args:
+        memory_uuid: UUID of the memory (from search_memories results)
+        limit: Maximum code chunks to return (default: 10)
+
+    Returns:
+        {
+            "memory_uuid": "...",
+            "related_code": [...],
+            "count": 3
+        }
+    """
+    try:
+        log.info(f"memory_related_code called (memory={memory_uuid[:8]}...)")
+        client = await _get_client()
+        return await client.memory_related_code(
+            memory_uuid=memory_uuid,
+            limit=limit,
+        )
+    except BackendError as e:
+        log.error(f"memory_related_code failed: {e}")
+        return {"error": e.detail, "related_code": [], "count": 0}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # GRAPH TOOLS
 # ═══════════════════════════════════════════════════════════════════════════════
