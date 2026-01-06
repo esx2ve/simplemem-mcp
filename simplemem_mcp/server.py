@@ -28,6 +28,8 @@ from simplemem_mcp.projects_utils import (
     find_project_root,
     suggest_project_names,
     create_bootstrap_config,
+    # Registry functions (for lossy path encoding)
+    register_project,
     # Exceptions and models
     NotBootstrappedError,
     SimpleMemConfig,
@@ -794,6 +796,9 @@ async def bootstrap_project(
             force=force,
         )
 
+        # Register in local registry for lossy path encoding resolution
+        register_project(resolved_path, config.project_id)
+
         log.info(f"bootstrap_project: created {config_path} with project_id={config.project_id}")
         return {
             "success": True,
@@ -886,6 +891,9 @@ async def attach_to_project(
             folder_role=folder_role,
             force=force,
         )
+
+        # Register in local registry for lossy path encoding resolution
+        register_project(resolved_path, config.project_id)
 
         log.info(f"attach_to_project: attached {resolved_path} to {project_id}")
         return {

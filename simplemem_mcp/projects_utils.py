@@ -588,8 +588,6 @@ project_id: "{config.project_id}"
             f.write(yaml_content)
 
         # Atomic rename
-        import os
-
         os.replace(tmp_path, config_path)
         log.info(f"Created bootstrap config at {config_path}")
 

@@ -6,7 +6,6 @@ The registry handles Claude's lossy path encoding where dots in paths
 
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -348,3 +347,97 @@ class TestInferProjectFromSessionPath:
         # Neither registry nor direct decode should work
         result = infer_project_from_session_path(session_file)
         assert result is None
+
+
+class TestBootstrapRegistersProject:
+    """Integration tests: Bootstrap/Attach tools register in the registry."""
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_project_registers(self, tmp_path, monkeypatch):
+        """bootstrap_project() should register project in local registry."""
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+
+        # Create project directory
+        project_dir = tmp_path / "myproject"
+        project_dir.mkdir()
+
+        # Import and call bootstrap_project
+        from simplemem_mcp import server as server_module
+
+        result = await server_module.bootstrap_project(
+            project_name="My Project",
+            path=str(project_dir),
+        )
+
+        assert result["success"] is True
+        assert result["project_id"] == "config:my-project"
+
+        # Verify project was registered
+        registry = load_project_registry()
+        encoded = encode_path_for_claude(str(project_dir.resolve()))
+        assert encoded in registry
+        assert registry[encoded]["project_id"] == "config:my-project"
+        assert registry[encoded]["canonical_path"] == str(project_dir.resolve())
+
+    @pytest.mark.asyncio
+    async def test_attach_to_project_registers(self, tmp_path, monkeypatch):
+        """attach_to_project() should register project in local registry."""
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+
+        # Create project directory
+        project_dir = tmp_path / "second-folder"
+        project_dir.mkdir()
+
+        # Import and call attach_to_project
+        from simplemem_mcp import server as server_module
+
+        result = await server_module.attach_to_project(
+            project_id="config:shared-project",
+            path=str(project_dir),
+        )
+
+        assert result["success"] is True
+        assert result["project_id"] == "config:shared-project"
+
+        # Verify project was registered
+        registry = load_project_registry()
+        encoded = encode_path_for_claude(str(project_dir.resolve()))
+        assert encoded in registry
+        assert registry[encoded]["project_id"] == "config:shared-project"
+
+
+class TestEndToEndSessionProcessing:
+    """E2E: Bootstrap → Register → Process session trace via registry."""
+
+    @pytest.mark.asyncio
+    async def test_e2e_dotted_path_resolves_via_registry(self, tmp_path, monkeypatch):
+        """E2E: Bootstrap a project with dots in path, then resolve session traces."""
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+
+        # Create project with dot in path (simulating shimon.vainer)
+        project_dir = tmp_path / "user.name" / "repo"
+        project_dir.mkdir(parents=True)
+
+        # Bootstrap the project (which registers it)
+        from simplemem_mcp import server as server_module
+
+        result = await server_module.bootstrap_project(
+            project_name="Test Repo",
+            path=str(project_dir),
+        )
+        assert result["success"] is True
+
+        # Simulate Claude's session trace path using the encoded path
+        encoded = encode_path_for_claude(str(project_dir.resolve()))
+        traces_dir = tmp_path / ".claude" / "projects"
+        session_dir = traces_dir / encoded
+        session_dir.mkdir(parents=True)
+        session_file = session_dir / "abc123.jsonl"
+        session_file.touch()
+
+        # Infer project from session path - should work via registry
+        inferred = infer_project_from_session_path(session_file)
+        assert inferred == "config:test-repo"
