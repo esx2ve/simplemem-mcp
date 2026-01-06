@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -160,6 +161,81 @@ PROJECT_MARKERS = [
 
 # Git command timeout in seconds
 GIT_TIMEOUT = 2
+
+# Project registry path (local-only, handles lossy Claude path encoding)
+REGISTRY_PATH = Path.home() / ".simplemem" / "project_registry.json"
+
+
+# =============================================================================
+# PROJECT REGISTRY FUNCTIONS
+# =============================================================================
+# The registry maps Claude's encoded session paths to canonical paths + project_id.
+# This handles lossy encoding where dots in paths (e.g., shimon.vainer) become
+# indistinguishable from path separators when decoded naively.
+
+
+def encode_path_for_claude(path: str) -> str:
+    """Encode a path the same way Claude does for session directories.
+
+    Claude encodes project paths by replacing '/' with '-'.
+
+    Args:
+        path: The canonical absolute path (e.g., "/Users/shimon.vainer/repo")
+
+    Returns:
+        Encoded path (e.g., "-Users-shimon.vainer-repo")
+    """
+    return path.replace("/", "-")
+
+
+def load_project_registry() -> dict[str, dict[str, str]]:
+    """Load the project registry from disk.
+
+    Returns:
+        Dict mapping encoded paths to {canonical_path, project_id}.
+        Returns empty dict if file doesn't exist or is corrupted.
+    """
+    if not REGISTRY_PATH.exists():
+        return {}
+    try:
+        return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        log.warning(f"Failed to load project registry: {e}")
+        return {}  # Graceful fallback on corruption
+
+
+def save_project_registry(registry: dict[str, dict[str, str]]) -> None:
+    """Atomically save the project registry to disk.
+
+    Uses temp file + rename for atomicity.
+
+    Args:
+        registry: Dict mapping encoded paths to {canonical_path, project_id}
+    """
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(registry, indent=2), encoding="utf-8")
+    os.replace(tmp, REGISTRY_PATH)
+
+
+def register_project(canonical_path: Path, project_id: str) -> None:
+    """Register a project path in the registry.
+
+    Called during bootstrap/attach to create the encoded → canonical mapping.
+
+    Args:
+        canonical_path: The actual filesystem path
+        project_id: The project ID (e.g., "config:simplemem")
+    """
+    registry = load_project_registry()
+    resolved = str(canonical_path.resolve())
+    encoded = encode_path_for_claude(resolved)
+    registry[encoded] = {
+        "canonical_path": resolved,
+        "project_id": project_id,
+    }
+    save_project_registry(registry)
+    log.debug(f"Registered project: {encoded} -> {project_id}")
 
 
 def normalize_git_url(url: str) -> str:
