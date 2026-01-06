@@ -4,4 +4,3 @@
 version: 1
 project_id: "config:simplemem"
 project_name: "SimpleMem MCP"
-folder_role: "source"
