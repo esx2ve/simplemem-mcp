@@ -934,12 +934,16 @@ async def process_trace_batch(
             local_errors.append({"session_id": session_id, "error": "Missing session_id"})
             continue
 
-        if not session_path:
-            # Try to find the path
+        if session_path:
+            # Convert string path to Path object
+            session_path = Path(session_path)
+        else:
+            # Fallback: look up path by session_id (only works for UUID sessions)
             session_path = await asyncio.to_thread(reader.find_session_path, session_id)
-            if session_path is None:
-                local_errors.append({"session_id": session_id, "error": "Session path not found"})
-                continue
+
+        if session_path is None or not session_path.exists():
+            local_errors.append({"session_id": session_id, "error": "Session path not found"})
+            continue
 
         try:
             # Read trace content

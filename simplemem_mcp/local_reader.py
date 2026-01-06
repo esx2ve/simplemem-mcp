@@ -119,8 +119,9 @@ class LocalReader:
                         project_name = parts[-1] if parts else project_name
 
                     sessions.append({
-                        "id": trace_file.stem[:8],  # Truncated UUID for display
-                        "session_id": trace_file.stem,  # Full UUID for operations
+                        "id": trace_file.stem[:8],  # Truncated ID for display
+                        "session_id": trace_file.stem,  # Full ID for operations
+                        "path": str(trace_file),  # Full path for direct access
                         "project": project_name,
                         "size_kb": stat.st_size // 1024,
                         "modified": stat.st_mtime,
