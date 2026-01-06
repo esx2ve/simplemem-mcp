@@ -712,24 +712,42 @@ def decode_claude_path(encoded_path: str) -> str | None:
 def infer_project_from_session_path(session_path: Path) -> str | None:
     """Infer project_id from a Claude trace file path.
 
-    IMPORTANT: This function only returns project_id if the decoded path
-    has a valid .simplemem.yaml config. Sessions from non-bootstrapped
-    projects are skipped.
+    Uses two-phase lookup:
+    1. Registry lookup (O(1), handles lossy path encoding)
+    2. Fallback to direct decode (for simple paths without dots)
+
+    The registry handles paths with dots (e.g., shimon.vainer) that become
+    ambiguous when decoded naively.
 
     Args:
         session_path: Path to the session trace file
 
     Returns:
         Project ID with "config:" prefix, or None if:
-        - Path cannot be decoded
-        - Decoded path doesn't exist locally
-        - Project is not bootstrapped (no .simplemem.yaml)
+        - Not found in registry AND
+        - Path cannot be decoded OR doesn't exist OR not bootstrapped
     """
     try:
         # The parent directory name is the encoded project path
         encoded_name = session_path.parent.name
-        decoded_path = decode_claude_path(encoded_name)
 
+        # Phase 1: Registry lookup (handles lossy encoding like dots in paths)
+        registry = load_project_registry()
+        if encoded_name in registry:
+            entry = registry[encoded_name]
+            # Validate registry entry structure
+            if isinstance(entry, dict):
+                project_id = entry.get("project_id")
+                if isinstance(project_id, str) and project_id.startswith("config:"):
+                    log.debug("Found %s in registry -> %s", encoded_name, project_id)
+                    return project_id
+                else:
+                    log.warning("Malformed registry entry for %s: invalid project_id", encoded_name)
+            else:
+                log.warning("Malformed registry entry for %s: not a dict", encoded_name)
+
+        # Phase 2: Fallback to direct decode (works for simple paths)
+        decoded_path = decode_claude_path(encoded_name)
         if decoded_path:
             resolved = Path(decoded_path).resolve()
             if resolved.exists():

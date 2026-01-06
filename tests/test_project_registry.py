@@ -14,6 +14,7 @@ from simplemem_mcp import projects_utils
 from simplemem_mcp.projects_utils import (
     REGISTRY_PATH,
     encode_path_for_claude,
+    infer_project_from_session_path,
     load_project_registry,
     register_project,
     save_project_registry,
@@ -218,3 +219,132 @@ class TestRegisterProject:
         # Should be registered under the resolved (actual) path
         encoded = encode_path_for_claude(str(actual_dir.resolve()))
         assert encoded in registry
+
+
+class TestInferProjectFromSessionPath:
+    """Tests for infer_project_from_session_path with registry lookup."""
+
+    def test_infer_from_registry_with_dotted_path(self, tmp_path, monkeypatch):
+        """Critical: Dotted username paths resolve via registry lookup."""
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+
+        # Register a project with dotted path (like shimon.vainer)
+        # Canonical path: /Users/shimon.vainer/repo/proj
+        # Claude encodes as: -Users-shimon.vainer-repo-proj
+        canonical = "/Users/shimon.vainer/repo/proj"
+        encoded = encode_path_for_claude(canonical)
+
+        # Manually populate registry (simulating bootstrap_project)
+        registry = {
+            encoded: {
+                "canonical_path": canonical,
+                "project_id": "config:myproj",
+            }
+        }
+        save_project_registry(registry)
+
+        # Simulate a session trace path
+        traces_dir = tmp_path / ".claude" / "projects"
+        session_dir = traces_dir / encoded
+        session_dir.mkdir(parents=True)
+        session_file = session_dir / "abc123.jsonl"
+        session_file.touch()
+
+        # Should find via registry, not direct decode
+        result = infer_project_from_session_path(session_file)
+        assert result == "config:myproj"
+
+    def test_infer_from_registry_takes_priority(self, tmp_path, monkeypatch):
+        """Registry lookup takes priority over direct decode."""
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+
+        # Create a real bootstrapped project
+        project_dir = tmp_path / "myproject"
+        project_dir.mkdir()
+        config_path = project_dir / ".simplemem.yaml"
+        config_path.write_text('version: 1\nproject_id: "config:from-config"')
+
+        # But also register a different project_id in registry
+        encoded = encode_path_for_claude(str(project_dir.resolve()))
+        registry = {
+            encoded: {
+                "canonical_path": str(project_dir.resolve()),
+                "project_id": "config:from-registry",  # Different!
+            }
+        }
+        save_project_registry(registry)
+
+        # Simulate session path
+        traces_dir = tmp_path / ".claude" / "projects"
+        session_dir = traces_dir / encoded
+        session_dir.mkdir(parents=True)
+        session_file = session_dir / "session.jsonl"
+        session_file.touch()
+
+        # Registry should win (Phase 1 lookup)
+        result = infer_project_from_session_path(session_file)
+        assert result == "config:from-registry"
+
+    def test_infer_empty_registry_fallback_to_decode(self, tmp_path, monkeypatch):
+        """With empty registry, falls back to direct decode for simple paths.
+
+        Note: The fallback only works for paths without dots in ANY component.
+        Paths like /Users/shimon.vainer/... will fail without registry (by design).
+        This test uses mocking to isolate the fallback logic.
+        """
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+
+        # Create a real bootstrapped project
+        project_dir = tmp_path / "simpleproject"
+        project_dir.mkdir()
+        config_path = project_dir / ".simplemem.yaml"
+        config_path.write_text('version: 1\nproject_id: "config:simple"')
+
+        # No registry entry (empty registry)
+        save_project_registry({})
+
+        # Use a fake simple path encoding that decodes to our real project
+        # This simulates a system where tmp_path doesn't have dots
+        simple_encoded = "-simple-test-path"
+        real_project_path = str(project_dir.resolve())
+
+        # Mock decode_claude_path to return our actual project path
+        original_decode = projects_utils.decode_claude_path
+
+        def mock_decode(encoded):
+            if encoded == simple_encoded:
+                return real_project_path
+            return original_decode(encoded)
+
+        monkeypatch.setattr(projects_utils, "decode_claude_path", mock_decode)
+
+        # Create session file with our simple encoding
+        traces_dir = tmp_path / ".claude" / "projects"
+        session_dir = traces_dir / simple_encoded
+        session_dir.mkdir(parents=True)
+        session_file = session_dir / "session.jsonl"
+        session_file.touch()
+
+        # Should fallback to direct decode and find the config
+        result = infer_project_from_session_path(session_file)
+        assert result == "config:simple"
+
+    def test_infer_not_in_registry_path_not_exist(self, tmp_path, monkeypatch):
+        """Not in registry and decoded path doesn't exist returns None."""
+        reg_path = tmp_path / ".simplemem" / "project_registry.json"
+        monkeypatch.setattr(projects_utils, "REGISTRY_PATH", reg_path)
+        save_project_registry({})
+
+        # Simulate session path for non-existent project
+        traces_dir = tmp_path / ".claude" / "projects"
+        session_dir = traces_dir / "-Users-nonexistent-path"
+        session_dir.mkdir(parents=True)
+        session_file = session_dir / "session.jsonl"
+        session_file.touch()
+
+        # Neither registry nor direct decode should work
+        result = infer_project_from_session_path(session_file)
+        assert result is None

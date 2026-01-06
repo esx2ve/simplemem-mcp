@@ -1,0 +1,7 @@
+# SimpleMem project configuration
+# See: https://github.com/shimonvainer/simplemem
+
+version: 1
+project_id: "config:simplemem"
+project_name: "SimpleMem MCP"
+folder_role: "source"
