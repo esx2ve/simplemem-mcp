@@ -19,10 +19,19 @@ from mcp.server.fastmcp import FastMCP
 from simplemem_mcp.client import BackendClient, BackendError
 from simplemem_mcp.local_reader import LocalReader
 from simplemem_mcp.projects_utils import (
+    # Core functions
     get_project_id as generate_project_id,
     infer_project_from_session_path,
     parse_project_id,
     extract_project_name,
+    # Bootstrap functions
+    find_project_root,
+    suggest_project_names,
+    create_bootstrap_config,
+    # Exceptions and models
+    NotBootstrappedError,
+    SimpleMemConfig,
+    ProjectNameSuggestion,
 )
 from simplemem_mcp.watcher import CloudWatcherManager
 
@@ -85,36 +94,54 @@ async def _get_watcher_manager() -> CloudWatcherManager:
     return _watcher_manager
 
 
-def _resolve_project_id(project_id: str | None) -> str | None:
-    """Resolve project_id using hybrid identification strategies.
+def _resolve_project_id(
+    project_id: str | None = None,
+    path: str | None = None,
+    require_bootstrap: bool = True,
+) -> str | None:
+    """Resolve project_id from .simplemem.yaml config (STRICT MODE).
 
-    Uses hierarchical ID generation:
-    1. Git remote URL (most stable, cross-machine)
-    2. Config file UUID (.simplemem.json)
-    3. Content hash of project markers
-    4. Resolved absolute path (fallback)
+    IMPORTANT: This function enforces mandatory bootstrap. If no config
+    is found, NotBootstrappedError is raised with helpful suggestions.
 
     Args:
-        project_id: Optional explicit project_id (if prefixed, used as-is)
+        project_id: Optional explicit project_id. If provided with "config:"
+                    prefix, validated against actual config.
+        path: Optional path to resolve from. Defaults to cwd.
+        require_bootstrap: If True (default), raise NotBootstrappedError
+                          if no config found. If False, return None.
 
     Returns:
-        Project ID with prefix (git:, uuid:, hash:, path:) or None
-    """
-    if project_id:
-        # Check if already has a prefix (properly formatted ID)
-        if any(project_id.startswith(p) for p in ["git:", "uuid:", "hash:", "path:"]):
-            return project_id
-        # Treat as path and generate proper hierarchical ID
-        return generate_project_id(project_id)
+        Project ID with "config:" prefix from .simplemem.yaml
 
-    # Auto-resolve from current working directory
+    Raises:
+        NotBootstrappedError: If require_bootstrap=True and no config found
+    """
+    resolved_path = Path(path).resolve() if path else Path.cwd().resolve()
+
     try:
-        cwd = Path.cwd().resolve()
-        project_id = generate_project_id(cwd)
-        log.debug(f"Auto-resolved project_id from cwd: {project_id}")
-        return project_id
-    except Exception as e:
-        log.warning(f"Failed to resolve project_id from cwd: {e}")
+        # find_project_root raises NotBootstrappedError if no config
+        config_dir, config = find_project_root(resolved_path)
+        actual_project_id = config.project_id
+
+        # If explicit project_id provided, validate it matches config
+        if project_id:
+            # Normalize: add config: prefix if missing
+            if not project_id.startswith("config:"):
+                project_id = f"config:{project_id}"
+
+            if project_id != actual_project_id:
+                log.warning(
+                    f"Explicit project_id '{project_id}' doesn't match config "
+                    f"'{actual_project_id}'. Using config value."
+                )
+
+        log.debug(f"Resolved project_id: {actual_project_id} from {config_dir}")
+        return actual_project_id
+
+    except NotBootstrappedError:
+        if require_bootstrap:
+            raise
         return None
 
 
@@ -162,7 +189,7 @@ async def store_memory(
         store_memory(
             text="Database connection timeout was caused by missing connection pool limits. Fixed by setting max_connections=20 in config.py:45",
             type="lesson_learned",
-            project_id="git:github.com/user/myproject"
+            project_id="config:mycompany/myproject"
         )
 
         # After architectural decision
@@ -196,7 +223,11 @@ async def store_memory(
         On success: {"uuid": "<memory-uuid>"} - Save this UUID for creating relations
         On error: {"error": "<error-message>"}
     """
-    resolved_project_id = _resolve_project_id(project_id)
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
     log.info(f"store_memory called (type={type}, project={resolved_project_id})")
     try:
         client = await _get_client()
@@ -249,7 +280,7 @@ async def search_memories(
         search_memories(
             query="project architecture and key patterns",
             type_filter="decision",
-            project_id="git:github.com/user/myproject"
+            project_id="config:mycompany/myproject"
         )
 
         # When hitting an error
@@ -289,7 +320,11 @@ async def search_memories(
         ]}
         On error: {"error": "...", "results": []}
     """
-    resolved_project_id = _resolve_project_id(project_id)
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
     try:
         log.info(f"search_memories called (query='{query[:50]}...', limit={limit}, project={resolved_project_id})")
         client = await _get_client()
@@ -311,6 +346,7 @@ async def relate_memories(
     from_id: str,
     to_id: str,
     relation_type: str = "relates",
+    project_id: str | None = None,
 ) -> dict:
     """Create a relationship between two memories in the knowledge graph.
 
@@ -352,11 +388,17 @@ async def relate_memories(
         to_id: Target memory UUID (the one being related to)
         relation_type: Type of relationship. Choose the most specific type
                        that describes the connection.
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
 
     Returns:
         On success: {"success": true}
         On error: {"error": "...", "success": false}
     """
+    try:
+        _resolve_project_id(project_id)  # Enforce bootstrap
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
     try:
         log.info(f"relate_memories called ({from_id[:8]} -> {to_id[:8]})")
         client = await _get_client()
@@ -408,7 +450,7 @@ async def ask_memories(
         # Get a synthesized solution to a past problem
         ask_memories(
             query="What was the solution to the database connection timeout issue?",
-            project_id="git:github.com/user/myproject"
+            project_id="config:mycompany/myproject"
         )
 
         # Understand how something was implemented
@@ -442,7 +484,11 @@ async def ask_memories(
             "sources": [{"uuid": "...", "content": "...", "citation": 1}, ...]
         }
     """
-    resolved_project_id = _resolve_project_id(project_id)
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
     try:
         log.info(f"ask_memories called (query='{query[:50]}...', project={resolved_project_id})")
         client = await _get_client()
@@ -501,7 +547,7 @@ async def reason_memories(
         # Trace cause-effect
         reason_memories(
             query="What led to the decision to migrate to PostgreSQL?",
-            project_id="git:github.com/user/myproject"
+            project_id="config:mycompany/myproject"
         )
 
         # Connect related solutions
@@ -531,7 +577,11 @@ async def reason_memories(
             ]
         }
     """
-    resolved_project_id = _resolve_project_id(project_id)
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
     try:
         log.info(f"reason_memories called (query='{query[:50]}...', project={resolved_project_id})")
         client = await _get_client()
@@ -548,58 +598,44 @@ async def reason_memories(
 
 @mcp.tool()
 async def get_project_id(path: str | None = None) -> dict:
-    """Get the canonical project_id for a path or current working directory.
+    """Get the canonical project_id from .simplemem.yaml config.
 
-    PURPOSE: Obtain the stable project identifier for use with memory tools.
-    The project_id ensures memories are isolated per-project and remain
-    consistent even if the project is moved or cloned elsewhere.
+    PURPOSE: Obtain the project identifier for use with memory tools.
+    Projects MUST be bootstrapped with .simplemem.yaml before use.
 
     WHEN TO USE:
-    - At session start to get the current project's ID
+    - At session start to verify project is bootstrapped
     - When you need to explicitly pass project_id to other tools
     - To verify which project you're working in
-    - When setting up project isolation for memory operations
 
-    PROJECT_ID HIERARCHY (most stable first):
-    1. git:github.com/user/repo - From git remote (survives moves/clones) - PREFERRED
-    2. config:mycompany/myproject - From .simplemem.yaml (explicit control)
-    3. hash:a1b2c3d4... - DEPRECATED (from package.json etc.) - logs warning
-    4. path:/Users/... - DEPRECATED (absolute path fallback) - logs warning
+    PROJECT_ID FORMAT:
+    - config:mycompany/myproject - ONLY valid format (from .simplemem.yaml)
 
-    IMPORTANT: Hash and path-based IDs are deprecated and will be removed.
-    Projects MUST have either a git remote or a .simplemem.yaml config file.
-
-    To create a config file, add .simplemem.yaml to your project root:
-        version: 1
-        project_id: "mycompany/myproject"
+    If not bootstrapped, returns error with suggestions. Use suggest_bootstrap()
+    to get recommended project names, then bootstrap_project() to initialize.
 
     EXAMPLES:
         # Get ID for current working directory
         get_project_id()
-        # Returns: {"project_id": "git:github.com/user/myproject", "id_type": "git", ...}
+        # Returns: {"project_id": "config:simplemem", "is_bootstrapped": True, ...}
 
-        # Get ID for a project with config file
-        get_project_id("~/code/another-project")
-        # Returns: {"project_id": "config:mycompany/project", "id_type": "config", ...}
-
-        # Use the returned project_id with memory tools
-        result = get_project_id()
-        search_memories(query="...", project_id=result["project_id"])
+        # Not bootstrapped - returns error with suggestions
+        get_project_id("~/code/new-project")
+        # Returns: {"error": "SIMPLEMEM_NOT_BOOTSTRAPPED", "suggested_names": [...]}
 
     Args:
         path: Path to resolve. Defaults to current working directory.
-              Can be absolute or relative (will be resolved).
 
     Returns:
         On success: {
-            "project_id": "git:github.com/user/repo",  # Use this with other tools
-            "id_type": "git",                          # How the ID was determined
-            "id_value": "github.com/user/repo",        # The ID without prefix
-            "project_name": "repo",                    # Human-readable name
-            "path": "/Users/.../repo",                 # Resolved absolute path
-            "message": "Project identified via git..."
+            "project_id": "config:myproject",
+            "id_type": "config",
+            "id_value": "myproject",
+            "project_name": "My Project",
+            "config_path": "/path/to/.simplemem.yaml",
+            "is_bootstrapped": True
         }
-        On error: {"error": "..."}
+        On not bootstrapped: NotBootstrappedError.to_dict()
     """
     try:
         if path:
@@ -607,21 +643,276 @@ async def get_project_id(path: str | None = None) -> dict:
         else:
             resolved_path = Path.cwd().resolve()
 
-        project_id = generate_project_id(resolved_path)
-        id_type, id_value = parse_project_id(project_id)
-        project_name = extract_project_name(project_id)
+        config_dir, config = find_project_root(resolved_path)
+        id_type, id_value = parse_project_id(config.project_id)
+        project_name = config.project_name or extract_project_name(config.project_id)
 
-        log.info(f"get_project_id called: {project_id} (type={id_type})")
+        log.info(f"get_project_id called: {config.project_id}")
         return {
-            "project_id": project_id,
+            "project_id": config.project_id,
             "id_type": id_type,
             "id_value": id_value,
             "project_name": project_name,
-            "path": str(resolved_path),
-            "message": f"Project identified via {id_type}. Use this project_id with memory tools for isolation.",
+            "config_path": str(config_dir / ".simplemem.yaml"),
+            "folder_role": config.folder_role,
+            "is_bootstrapped": True,
         }
+    except NotBootstrappedError as e:
+        log.info(f"get_project_id: project not bootstrapped at {path or 'cwd'}")
+        return e.to_dict()
     except Exception as e:
         log.error(f"get_project_id failed: {e}")
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOOTSTRAP TOOLS (exempt from bootstrap check)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def suggest_bootstrap(path: str | None = None) -> dict:
+    """Get bootstrap suggestions for a folder (READ-ONLY).
+
+    Use this tool to understand how to bootstrap a project. Returns
+    suggested project names based on available markers (git remote,
+    pyproject.toml, package.json, etc.) without making any changes.
+
+    WHEN TO USE:
+    - Before bootstrapping to see available suggestions
+    - To check if a folder is already bootstrapped
+    - To understand what project name would be recommended
+
+    Args:
+        path: Directory to analyze. Defaults to current working directory.
+
+    Returns:
+        {
+            "is_bootstrapped": False,
+            "suggested_names": [
+                {"name": "simplemem-mcp", "source": "git_remote", "confidence": 95},
+                {"name": "simplemem-mcp", "source": "pyproject", "confidence": 85},
+                {"name": "simplemem-mcp", "source": "directory", "confidence": 50}
+            ],
+            "path": "/path/to/folder",
+            "config_path": null,  # Where config would be created
+            "recommended": "simplemem-mcp"  # Highest confidence suggestion
+        }
+    """
+    try:
+        resolved_path = Path(path).expanduser().resolve() if path else Path.cwd().resolve()
+
+        # Check if already bootstrapped
+        try:
+            config_dir, config = find_project_root(resolved_path)
+            return {
+                "is_bootstrapped": True,
+                "project_id": config.project_id,
+                "project_name": config.project_name,
+                "config_path": str(config_dir / ".simplemem.yaml"),
+                "path": str(resolved_path),
+                "message": "Project is already bootstrapped. No action needed.",
+            }
+        except NotBootstrappedError:
+            pass
+
+        # Not bootstrapped - get suggestions
+        suggestions = suggest_project_names(resolved_path)
+        suggestion_dicts = [
+            {"name": s.name, "source": s.source, "confidence": s.confidence}
+            for s in suggestions
+        ]
+
+        return {
+            "is_bootstrapped": False,
+            "suggested_names": suggestion_dicts,
+            "path": str(resolved_path),
+            "config_path": str(resolved_path / ".simplemem.yaml"),
+            "recommended": suggestions[0].name if suggestions else resolved_path.name,
+            "message": "Project needs bootstrap. Use bootstrap_project() with one of the suggested names.",
+        }
+    except Exception as e:
+        log.error(f"suggest_bootstrap failed: {e}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def bootstrap_project(
+    project_name: str,
+    project_id: str | None = None,
+    path: str | None = None,
+    folder_role: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Bootstrap a folder for SimpleMem - creates .simplemem.yaml config.
+
+    This is the REQUIRED first step before using any SimpleMem tools.
+    Creates a .simplemem.yaml config file that identifies the project.
+
+    WHEN TO USE:
+    - First time setting up SimpleMem for a project
+    - Creating a new project from scratch
+    - Initializing a folder that should be tracked separately
+
+    Args:
+        project_name: Human-readable project name (e.g., "SimpleMem MCP")
+        project_id: Explicit project_id (default: auto-generated from name).
+                    Must start with "config:" if provided.
+        path: Directory where to create config. Defaults to cwd.
+        folder_role: Optional role ("source", "tests", "docs", "config", "scripts")
+        force: Overwrite existing config if True (default: False)
+
+    Returns:
+        On success: {
+            "success": True,
+            "project_id": "config:simplemem-mcp",
+            "project_name": "SimpleMem MCP",
+            "config_path": "/path/to/.simplemem.yaml",
+            "message": "Project bootstrapped successfully!"
+        }
+        On error: {"error": "..."}
+
+    Examples:
+        # Bootstrap with auto-generated ID
+        bootstrap_project(project_name="My Project")
+        # Creates config with project_id="config:my-project"
+
+        # Bootstrap with explicit ID
+        bootstrap_project(project_name="My Project", project_id="config:myorg/myproject")
+
+        # Bootstrap with role
+        bootstrap_project(project_name="My Docs", folder_role="docs")
+    """
+    try:
+        resolved_path = Path(path).expanduser().resolve() if path else Path.cwd().resolve()
+
+        config_path, config = create_bootstrap_config(
+            path=resolved_path,
+            project_name=project_name,
+            project_id=project_id,
+            folder_role=folder_role,
+            force=force,
+        )
+
+        log.info(f"bootstrap_project: created {config_path} with project_id={config.project_id}")
+        return {
+            "success": True,
+            "project_id": config.project_id,
+            "project_name": config.project_name,
+            "folder_role": config.folder_role,
+            "config_path": str(config_path),
+            "message": f"Project bootstrapped successfully! Use project_id='{config.project_id}' with all SimpleMem tools.",
+        }
+    except FileExistsError as e:
+        return {
+            "error": "CONFIG_EXISTS",
+            "message": str(e),
+            "suggestion": "Use force=True to overwrite, or use attach_to_project() to join an existing project.",
+        }
+    except ValueError as e:
+        return {
+            "error": "VALIDATION_ERROR",
+            "message": str(e),
+        }
+    except Exception as e:
+        log.error(f"bootstrap_project failed: {e}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def attach_to_project(
+    project_id: str,
+    path: str | None = None,
+    project_name: str | None = None,
+    folder_role: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Attach this folder to an existing project.
+
+    Creates .simplemem.yaml with the SAME project_id as another folder,
+    effectively merging memories and code index into one project.
+
+    Use this when you have multiple folders that should share the same
+    project context (e.g., simplemem-mcp and simplemem_lite both under
+    the "simplemem" project).
+
+    WHEN TO USE:
+    - Adding a second/third folder to an existing project
+    - Merging code repositories under one project umbrella
+    - Setting up monorepo subdirectories
+
+    Args:
+        project_id: Project ID to join (e.g., "config:simplemem").
+                    Must match an existing project's ID.
+        path: Directory where to create config. Defaults to cwd.
+        project_name: Optional display name for this folder (defaults to dir name)
+        folder_role: Optional role ("source", "tests", "docs", etc.)
+        force: Overwrite existing config if True (default: False)
+
+    Returns:
+        On success: {
+            "success": True,
+            "project_id": "config:simplemem",
+            "attached_path": "/path/to/folder",
+            "message": "Folder attached to project..."
+        }
+
+    Examples:
+        # Attach current folder to existing project
+        attach_to_project(project_id="config:simplemem")
+
+        # Attach with specific role
+        attach_to_project(
+            project_id="config:simplemem",
+            folder_role="tests",
+            project_name="SimpleMem Tests"
+        )
+    """
+    try:
+        resolved_path = Path(path).expanduser().resolve() if path else Path.cwd().resolve()
+
+        # Ensure project_id has config: prefix
+        if not project_id.startswith("config:"):
+            project_id = f"config:{project_id}"
+
+        # Use directory name as default project_name
+        if not project_name:
+            project_name = resolved_path.name
+
+        config_path, config = create_bootstrap_config(
+            path=resolved_path,
+            project_name=project_name,
+            project_id=project_id,
+            folder_role=folder_role,
+            force=force,
+        )
+
+        log.info(f"attach_to_project: attached {resolved_path} to {project_id}")
+        return {
+            "success": True,
+            "project_id": config.project_id,
+            "project_name": config.project_name,
+            "folder_role": config.folder_role,
+            "attached_path": str(resolved_path),
+            "config_path": str(config_path),
+            "message": (
+                f"Folder attached to project '{project_id}'. "
+                "Memories and code index will now be shared with other folders using this project_id."
+            ),
+        }
+    except FileExistsError as e:
+        return {
+            "error": "CONFIG_EXISTS",
+            "message": str(e),
+            "suggestion": "Use force=True to overwrite existing config.",
+        }
+    except ValueError as e:
+        return {
+            "error": "VALIDATION_ERROR",
+            "message": str(e),
+        }
+    except Exception as e:
+        log.error(f"attach_to_project failed: {e}")
         return {"error": str(e)}
 
 
@@ -717,6 +1008,17 @@ async def process_trace(
 
         # Infer project_id from the trace file path (Claude's encoded directory name)
         project_id = infer_project_from_session_path(session_path)
+        if project_id is None:
+            # Session is from a non-bootstrapped project
+            return {
+                "error": "SIMPLEMEM_NOT_BOOTSTRAPPED",
+                "message": (
+                    f"Session {session_id} is from a project that is not bootstrapped. "
+                    "Navigate to the original project directory and run bootstrap_project() first."
+                ),
+                "session_id": session_id,
+                "action_required": "bootstrap",
+            }
         log.info(f"Inferred project_id from session path: {project_id}")
 
         # Read trace content
@@ -945,6 +1247,16 @@ async def process_trace_batch(
             local_errors.append({"session_id": session_id, "error": "Session path not found"})
             continue
 
+        # Infer project_id - skip non-bootstrapped projects
+        project_id = infer_project_from_session_path(session_path)
+        if project_id is None:
+            local_errors.append({
+                "session_id": session_id,
+                "error": "SIMPLEMEM_NOT_BOOTSTRAPPED",
+                "message": "Session from non-bootstrapped project - bootstrap first",
+            })
+            continue
+
         try:
             # Read trace content
             trace_content = await asyncio.to_thread(reader.read_trace_file_by_path, session_path)
@@ -959,6 +1271,7 @@ async def process_trace_batch(
                 "session_id": session_id,
                 "trace_content": compressed,
                 "compressed": was_compressed,
+                "project_id": project_id,
             })
 
         except Exception as e:
@@ -1042,7 +1355,7 @@ async def search_code(
         # Search in specific project
         search_code(
             query="API rate limiting middleware",
-            project_id="git:github.com/user/myproject"
+            project_id="config:mycompany/myproject"
         )
 
         # Find error handling
@@ -1073,7 +1386,7 @@ async def search_code(
         On error: {"error": "...", "results": []}
     """
     try:
-        # Resolve project_id from path if only project_root provided
+        # Resolve project_id - require bootstrap
         resolved_project_id = project_id
         if not resolved_project_id and project_root:
             log.warning("search_code: project_root is deprecated, use project_id instead")
@@ -1081,7 +1394,10 @@ async def search_code(
         elif not resolved_project_id:
             # Auto-infer from current working directory
             resolved_project_id = _resolve_project_id(None)
+    except NotBootstrappedError as e:
+        return e.to_dict()
 
+    try:
         log.info(f"search_code called (query='{query[:50]}...', project_id={resolved_project_id})")
         client = await _get_client()
         return await client.search_code(
@@ -1263,8 +1579,12 @@ async def index_directory(
         if not directory.exists():
             return {"error": f"Directory not found: {path}"}
 
-        # Generate stable project_id
-        project_id = generate_project_id(directory)
+        # Resolve project_id - require bootstrap
+        try:
+            project_id = _resolve_project_id(path=str(directory))
+        except NotBootstrappedError as e:
+            return e.to_dict()
+
         log.info(f"index_directory called (path={path}, project_id={project_id}, dry_run={dry_run}, background={background})")
 
         reader = await _get_reader()
@@ -1330,7 +1650,7 @@ async def code_stats(
         Statistics including chunk count and unique files
     """
     try:
-        # Resolve project_id from path if only project_root provided
+        # Resolve project_id - require bootstrap
         resolved_project_id = project_id
         if not resolved_project_id and project_root:
             log.warning("code_stats: project_root is deprecated, use project_id instead")
@@ -1338,7 +1658,10 @@ async def code_stats(
         elif not resolved_project_id:
             # Auto-infer from current working directory
             resolved_project_id = _resolve_project_id(None)
+    except NotBootstrappedError as e:
+        return e.to_dict()
 
+    try:
         log.info(f"code_stats called (project_id={resolved_project_id})")
         client = await _get_client()
         return await client.code_stats(project_id=resolved_project_id)
@@ -1552,6 +1875,12 @@ async def start_code_watching(
         - patterns: The file patterns being watched
     """
     try:
+        # Enforce bootstrap
+        _resolve_project_id(path=project_root)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    try:
         log.info(f"start_code_watching called (project_root={project_root})")
         manager = await _get_watcher_manager()
         return manager.start_watching(project_root, patterns)
@@ -1605,56 +1934,81 @@ async def get_watcher_status(project_root: str | None = None) -> dict:
 async def get_project_status(project_root: str) -> dict:
     """Get bootstrap and watcher status for a project.
 
+    This tool is exempt from bootstrap check - it's used to determine
+    whether bootstrap is needed.
+
     Args:
         project_root: Absolute path to the project root directory
 
     Returns:
-        Dict with:
-        - is_known: Whether project is tracked
-        - is_bootstrapped: Whether project has been bootstrapped
-        - is_watching: Whether file watcher is active
-        - project_name: Detected project name
-        - should_ask: Whether to prompt for bootstrap
-        - deferred_context: Context from pending session (if any)
+        If bootstrapped: {
+            "is_bootstrapped": True,
+            "project_id": "config:simplemem",
+            "project_name": "SimpleMem",
+            "config_path": "/path/to/.simplemem.yaml",
+            "folder_role": "source",
+            "is_watching": True/False,
+            ...
+        }
+        If not bootstrapped: {
+            "is_bootstrapped": False,
+            "suggested_names": [...],
+            "action_required": "bootstrap",
+            ...
+        }
     """
     try:
         log.info(f"get_project_status called (project_root={project_root})")
+        resolved_path = Path(project_root).resolve()
 
         # Get local directory info
         reader = await _get_reader()
-        info = await asyncio.to_thread(reader.get_directory_info, Path(project_root))
+        info = await asyncio.to_thread(reader.get_directory_info, resolved_path)
 
         if info is None:
-            return {"error": "Could not read directory info"}
+            return {"error": "Could not read directory info", "path": str(resolved_path)}
 
-        # Get local watcher status (watchers run on MCP side)
+        # Get local watcher status
         manager = await _get_watcher_manager()
-        watcher_status = manager.get_status(project_root)
+        watcher_status = manager.get_status(str(resolved_path))
         is_watching = watcher_status.get("is_watching", False)
 
-        # Get bootstrap status from cloud backend
-        client = await _get_client()
+        # Check for local .simplemem.yaml config
         try:
-            backend_status = await client.get_project_status(project_root)
-            log.debug(f"Backend project status: {backend_status}")
-        except BackendError as e:
-            log.warning(f"Backend project status failed: {e}, using defaults")
-            backend_status = {}
-
-        # Merge local and cloud status
-        return {
-            # Local info
-            "exists": info.get("exists", False),
-            "is_git": info.get("is_git", False),
-            "file_count": info.get("file_count", 0),
-            "is_watching": is_watching,
-            # Cloud bootstrap status
-            "is_known": backend_status.get("is_known", False),
-            "is_bootstrapped": backend_status.get("is_bootstrapped", False),
-            "should_ask": backend_status.get("should_ask", True),
-            "project_name": backend_status.get("project_name") or Path(project_root).name,
-            "never_ask": backend_status.get("never_ask", False),
-        }
+            config_dir, config = find_project_root(resolved_path)
+            return {
+                "is_bootstrapped": True,
+                "project_id": config.project_id,
+                "project_name": config.project_name or extract_project_name(config.project_id),
+                "config_path": str(config_dir / ".simplemem.yaml"),
+                "folder_role": config.folder_role,
+                # Local info
+                "exists": info.get("exists", False),
+                "is_git": info.get("is_git", False),
+                "file_count": info.get("file_count", 0),
+                "is_watching": is_watching,
+                "path": str(resolved_path),
+            }
+        except NotBootstrappedError:
+            # Not bootstrapped - return suggestions
+            suggestions = suggest_project_names(resolved_path)
+            return {
+                "is_bootstrapped": False,
+                "suggested_names": [
+                    {"name": s.name, "source": s.source, "confidence": s.confidence}
+                    for s in suggestions
+                ],
+                "recommended": suggestions[0].name if suggestions else resolved_path.name,
+                "action_required": "bootstrap",
+                "config_path": str(resolved_path / ".simplemem.yaml"),
+                # Local info
+                "exists": info.get("exists", False),
+                "is_git": info.get("is_git", False),
+                "file_count": info.get("file_count", 0),
+                "is_watching": is_watching,
+                "path": str(resolved_path),
+                "message": "Project needs bootstrap. Use bootstrap_project() to initialize.",
+            }
     except Exception as e:
         log.error(f"get_project_status failed: {e}")
         return {"error": str(e)}
@@ -1686,6 +2040,12 @@ async def check_code_staleness(
         - files_modified_since: Count of files modified since last index
         - recommendation: Suggested action
     """
+    try:
+        # Enforce bootstrap
+        _resolve_project_id(path=project_root)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
     try:
         # For now, return a simple check - in future could track index timestamps
         return {

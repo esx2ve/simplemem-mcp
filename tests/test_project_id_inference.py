@@ -216,10 +216,10 @@ class TestProcessTraceProjectIdFlow:
     """Tests for the complete process_trace flow with project_id."""
 
     @pytest.mark.asyncio
-    async def test_process_trace_extracts_project_id(self):
-        """process_trace should extract and pass project_id to backend."""
+    async def test_process_trace_rejects_non_bootstrapped_session(self):
+        """process_trace should reject sessions from non-bootstrapped projects."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Setup mock traces directory
+            # Setup mock traces directory pointing to non-existent path
             traces_dir = Path(tmpdir) / ".claude" / "projects"
             project_dir = traces_dir / "-Users-shimon-repo-simplemem"
             project_dir.mkdir(parents=True)
@@ -227,6 +227,50 @@ class TestProcessTraceProjectIdFlow:
             # Use valid UUID format (required by LocalReader validation)
             session_id = "a1234567-b234-c345-d456-e56789012345"
             trace_file = project_dir / f"{session_id}.jsonl"
+            trace_file.write_text('{"type": "user", "message": {"content": "test"}}')
+
+            # Import server module and patch dependencies
+            import simplemem_mcp.server as server_module
+
+            # Create mock reader
+            from simplemem_mcp.local_reader import LocalReader
+            reader = LocalReader(traces_dir=traces_dir)
+
+            mock_client = AsyncMock()
+            with patch.object(server_module, "_get_client", return_value=mock_client):
+                with patch.object(server_module, "_get_reader", return_value=reader):
+                    # Call process_trace - should fail because project is not bootstrapped
+                    result = await server_module.process_trace(
+                        session_id=session_id,
+                        background=True,
+                    )
+
+            # Should return error, not call backend
+            assert result.get("error") == "SIMPLEMEM_NOT_BOOTSTRAPPED"
+            assert result.get("action_required") == "bootstrap"
+            mock_client.process_trace.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_trace_extracts_project_id_for_bootstrapped(self):
+        """process_trace should extract project_id for bootstrapped projects."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a bootstrapped project directory
+            project_root = Path(tmpdir) / "myproject"
+            project_root.mkdir()
+
+            # Create .simplemem.yaml config
+            config_path = project_root / ".simplemem.yaml"
+            config_path.write_text('version: 1\nproject_id: "config:myproject"')
+
+            # Setup traces directory with encoded path pointing to our bootstrapped project
+            traces_dir = Path(tmpdir) / ".claude" / "projects"
+            encoded_path = str(project_root).replace("/", "-")
+            project_trace_dir = traces_dir / encoded_path
+            project_trace_dir.mkdir(parents=True)
+
+            # Use valid UUID format
+            session_id = "a1234567-b234-c345-d456-e56789012345"
+            trace_file = project_trace_dir / f"{session_id}.jsonl"
             trace_file.write_text('{"type": "user", "message": {"content": "test"}}')
 
             # Mock the backend client
@@ -237,22 +281,18 @@ class TestProcessTraceProjectIdFlow:
 
             # Import server module and patch dependencies
             import simplemem_mcp.server as server_module
-
-            # Create mock reader
             from simplemem_mcp.local_reader import LocalReader
             reader = LocalReader(traces_dir=traces_dir)
 
             with patch.object(server_module, "_get_client", return_value=mock_client):
                 with patch.object(server_module, "_get_reader", return_value=reader):
-                    # Call process_trace
                     result = await server_module.process_trace(
                         session_id=session_id,
                         background=True,
                     )
 
-            # Verify client was called with correct project_id (now prefixed)
+            # Verify client was called with correct project_id
             mock_client.process_trace.assert_called_once()
             call_kwargs = mock_client.process_trace.call_args.kwargs
-            # New format uses path: prefix for decoded paths that don't exist locally
-            assert call_kwargs["project_id"] == "path:/Users/shimon/repo/simplemem"
+            assert call_kwargs["project_id"] == "config:myproject"
             assert call_kwargs["session_id"] == session_id

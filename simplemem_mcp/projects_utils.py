@@ -1,38 +1,150 @@
-"""Project ID utilities with deterministic identification strategies.
+"""Project ID utilities with mandatory bootstrap and multi-folder support.
 
-Hierarchical project identification (most stable first):
-1. Git remote URL - stable across machines and paths
-2. Config file (.simplemem.yaml) - explicit user control
+ARCHITECTURE:
+- Projects MUST be bootstrapped with .simplemem.yaml before use
+- Multiple folders can share the same project_id (memories/code merge)
+- 1 folder = 1 project (no overlapping membership)
+- Nearest config wins for nested configs (rare/discouraged)
 
-IMPORTANT: Hash-based and path-based project IDs are DEPRECATED.
-Projects MUST have either:
-- A git remote (preferred)
-- A .simplemem.yaml config file with explicit project_id
+ID Format:
+- config:mycompany/myproject - ONLY valid format (from .simplemem.yaml)
 
-ID Format Prefixes:
-- git:github.com/user/repo - Git remote based
-- config:mycompany/myproject - Config file based
-- hash:a1b2c3d4e5f6... - DEPRECATED (legacy, will be removed)
-- path:/Users/dev/project - DEPRECATED (legacy, will be removed)
+DEPRECATED (will error, not fallback):
+- git:, hash:, path: prefixes are no longer valid
 """
 
-import hashlib
+from __future__ import annotations
+
 import json
 import logging
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
+from pydantic import BaseModel, field_validator
 
 log = logging.getLogger("simplemem_mcp.projects_utils")
 
+
+# =============================================================================
+# DATACLASSES AND MODELS
+# =============================================================================
+
+
+@dataclass
+class ProjectNameSuggestion:
+    """Suggested project name with source and confidence.
+
+    Used during bootstrap to provide meaningful suggestions based on
+    available project markers (git remote, package.json, pyproject.toml, etc.)
+    """
+
+    name: str  # Proposed slug (e.g., "simplemem-mcp")
+    source: str  # "git_remote" | "pyproject" | "package_json" | "directory"
+    confidence: int  # 0-100, higher = more reliable
+
+
+@dataclass
+class NotBootstrappedError(Exception):
+    """Raised when a project requires bootstrap but .simplemem.yaml is missing.
+
+    This exception provides helpful context for the user including:
+    - The cwd where they attempted to use SimpleMem
+    - Paths that were searched for config
+    - Suggested project names based on available markers
+
+    Attributes:
+        message: Human-readable error description
+        cwd: Current working directory where the error occurred
+        searched_paths: List of paths that were searched for .simplemem.yaml
+        suggested_names: List of ProjectNameSuggestion for bootstrap
+        error_code: Machine-readable error code for programmatic handling
+    """
+
+    message: str
+    cwd: str
+    searched_paths: list[str] = field(default_factory=list)
+    suggested_names: list[ProjectNameSuggestion] = field(default_factory=list)
+    error_code: str = "SIMPLEMEM_NOT_BOOTSTRAPPED"
+
+    def __post_init__(self) -> None:
+        super().__init__(self.message)
+
+    def to_dict(self) -> dict:
+        """Convert to dict for JSON serialization in MCP responses."""
+        return {
+            "error": self.error_code,
+            "message": self.message,
+            "cwd": self.cwd,
+            "searched_paths": self.searched_paths,
+            "suggested_names": [
+                {"name": s.name, "source": s.source, "confidence": s.confidence}
+                for s in self.suggested_names
+            ],
+            "action_required": "bootstrap",
+            "help": (
+                "Run bootstrap_project() or attach_to_project() to initialize. "
+                "See suggested_names for recommended project identifiers."
+            ),
+        }
+
+
+class SimpleMemConfig(BaseModel):
+    """Pydantic model for .simplemem.yaml config validation.
+
+    Config file format:
+        version: 1
+        project_id: "config:simplemem"
+        project_name: "SimpleMem"  # optional display name
+        folder_role: "source"  # optional: source, tests, docs
+        exclude_patterns: []  # optional gitignore-style patterns
+
+    Multiple folders can share the same project_id to merge their
+    memories and code indexes into a single project.
+    """
+
+    version: int = 1
+    project_id: str  # Must start with "config:"
+    project_name: str | None = None  # Human-readable display name
+    folder_role: str | None = None  # "source" | "tests" | "docs" | None
+    exclude_patterns: list[str] = []
+
+    @field_validator("project_id")
+    @classmethod
+    def must_have_config_prefix(cls, v: str) -> str:
+        """Ensure project_id starts with 'config:' prefix."""
+        if not v.startswith("config:"):
+            raise ValueError(
+                f"project_id must start with 'config:' prefix, got: {v!r}. "
+                "Example: 'config:mycompany/myproject'"
+            )
+        # Validate the slug part
+        slug = v[7:]  # Remove 'config:' prefix
+        if not slug or slug.isspace():
+            raise ValueError("project_id slug cannot be empty after 'config:' prefix")
+        return v
+
+    @field_validator("folder_role")
+    @classmethod
+    def validate_folder_role(cls, v: str | None) -> str | None:
+        """Validate folder_role is one of allowed values."""
+        if v is None:
+            return None
+        allowed = {"source", "tests", "docs", "config", "scripts"}
+        if v not in allowed:
+            raise ValueError(f"folder_role must be one of {allowed}, got: {v!r}")
+        return v
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
 # Maximum directory levels to search upward for config
 CONFIG_SEARCH_MAX_DEPTH = 10
-
-# Config file names in order of preference
-CONFIG_FILES = [".simplemem.yaml", ".simplemem.yml", ".simplemem.json"]
 
 # Project marker files in priority order
 PROJECT_MARKERS = [
@@ -133,104 +245,59 @@ def get_git_remote_url(path: Path) -> str | None:
     return None
 
 
-def load_simplemem_config(path: Path) -> dict | None:
-    """Load .simplemem.json config file if it exists.
+# =============================================================================
+# BOOTSTRAP FUNCTIONS
+# =============================================================================
+
+
+def find_project_root(path: str | Path) -> tuple[Path, SimpleMemConfig]:
+    """Find the nearest .simplemem.yaml and return parsed config.
+
+    Walks up directory tree from path to find the nearest config file.
+    Validates through Pydantic and raises NotBootstrappedError if not found.
 
     Args:
-        path: Project root directory
+        path: Starting directory for search
 
     Returns:
-        Parsed config dict or None if not found/invalid
+        Tuple of (config_directory, SimpleMemConfig)
 
-    Config Schema:
-        {
-            "version": 1,
-            "project_id": "uuid:550e8400-e29b-41d4-a716-446655440000",
-            "name": "my-project",
-            "created": "2025-01-05T00:00:00Z"
-        }
+    Raises:
+        NotBootstrappedError: If no config found in any parent directory
     """
-    config_path = path / ".simplemem.json"
-    if not config_path.exists():
-        return None
+    resolved_path = Path(path).expanduser().resolve()
+    searched: list[str] = []
 
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-            if isinstance(config, dict) and "project_id" in config:
-                log.debug(f"Loaded config from {config_path}")
-                return config
-    except (json.JSONDecodeError, IOError) as e:
-        log.warning(f"Failed to load config {config_path}: {e}")
-
-    return None
-
-
-def load_simplemem_yaml(path: Path) -> dict | None:
-    """Load .simplemem.yaml config file if it exists.
-
-    Args:
-        path: Directory containing the config file (not the file path itself)
-
-    Returns:
-        Parsed config dict or None if not found/invalid
-    """
-    for config_name in [".simplemem.yaml", ".simplemem.yml"]:
-        config_path = path / config_name
-        if config_path.exists():
-            try:
-                with open(config_path, encoding="utf-8") as f:
-                    config = yaml.safe_load(f)
-
-                    # Validate structure
-                    if not isinstance(config, dict):
-                        log.warning(f"Config {config_path} must be a YAML mapping")
-                        continue
-
-                    # Validate project_id is a non-empty string
-                    project_id = config.get("project_id")
-                    if not isinstance(project_id, str) or not project_id.strip():
-                        log.warning(f"Config {config_path} requires 'project_id' to be a non-empty string")
-                        continue
-
-                    log.debug(f"Loaded YAML config from {config_path}")
-                    return config
-
-            except yaml.YAMLError as e:
-                log.warning(f"Failed to parse YAML config {config_path}: {e}")
-            except OSError as e:
-                log.warning(f"Failed to read config {config_path}: {e}")
-
-    return None
-
-
-def find_config_file(start_path: Path) -> tuple[Path, Mapping[str, Any]] | None:
-    """Walk up directory tree to find .simplemem.yaml config.
-
-    Searches from start_path upward (max CONFIG_SEARCH_MAX_DEPTH levels)
-    looking for .simplemem.yaml, .simplemem.yml, or .simplemem.json.
-
-    Args:
-        start_path: Starting directory for search
-
-    Returns:
-        Tuple of (config_directory, config_dict) or None if not found
-    """
-    current = start_path.resolve()
+    current = resolved_path
     depth = 0
 
     while depth < CONFIG_SEARCH_MAX_DEPTH:
-        # Try YAML config first (preferred)
-        yaml_config = load_simplemem_yaml(current)
-        if yaml_config:
-            log.debug(f"Found YAML config at {current} (depth={depth})")
-            return current, yaml_config
+        searched.append(str(current))
 
-        # Fall back to JSON config (legacy)
-        json_config = load_simplemem_config(current)
-        if json_config:
-            log.debug(f"Found JSON config at {current} (depth={depth})")
-            return current, json_config
+        # Try YAML config files
+        for config_name in [".simplemem.yaml", ".simplemem.yml"]:
+            config_path = current / config_name
+            if config_path.exists():
+                try:
+                    with open(config_path, encoding="utf-8") as f:
+                        raw_config = yaml.safe_load(f)
+
+                    if not isinstance(raw_config, dict):
+                        log.warning(f"Config {config_path} must be a YAML mapping")
+                        continue
+
+                    # Validate through Pydantic
+                    config = SimpleMemConfig(**raw_config)
+                    log.debug(f"Found valid config at {config_path}")
+                    return current, config
+
+                except yaml.YAMLError as e:
+                    log.warning(f"Failed to parse YAML config {config_path}: {e}")
+                except ValueError as e:
+                    # Pydantic validation error
+                    log.warning(f"Invalid config at {config_path}: {e}")
+                except OSError as e:
+                    log.warning(f"Failed to read config {config_path}: {e}")
 
         # Move up one level
         parent = current.parent
@@ -239,197 +306,255 @@ def find_config_file(start_path: Path) -> tuple[Path, Mapping[str, Any]] | None:
         current = parent
         depth += 1
 
-    log.debug(f"No config found searching from {start_path} (searched {depth} levels)")
-    return None
+    # No config found - generate suggestions and raise error
+    suggestions = suggest_project_names(resolved_path)
+
+    raise NotBootstrappedError(
+        message=(
+            f"Project not bootstrapped. No .simplemem.yaml found.\n"
+            f"Searched {len(searched)} directories from: {resolved_path}"
+        ),
+        cwd=str(resolved_path),
+        searched_paths=searched,
+        suggested_names=suggestions,
+    )
 
 
-def _extract_stable_identity(marker: str, content: bytes) -> str | None:
-    """Extract stable identity fields from marker file content.
+def suggest_project_names(path: str | Path) -> list[ProjectNameSuggestion]:
+    """Generate suggested project names from available markers.
 
-    Parses marker files to extract only stable fields (name, repository)
-    that won't change with version bumps or dependency updates.
+    Extracts project name suggestions from (in priority order):
+    1. Git remote URL (highest confidence)
+    2. pyproject.toml [project.name]
+    3. package.json name
+    4. Cargo.toml [package.name]
+    5. go.mod module path
+    6. Directory name (lowest confidence)
 
     Args:
-        marker: Marker filename (e.g., "package.json")
-        content: Raw file content
+        path: Directory to analyze for project markers
 
     Returns:
-        Stable identity string or None if parsing fails
+        List of ProjectNameSuggestion sorted by confidence (highest first)
     """
-    try:
-        text = content.decode("utf-8")
+    resolved_path = Path(path).expanduser().resolve()
+    suggestions: list[ProjectNameSuggestion] = []
 
-        if marker == "package.json":
-            data = json.loads(text)
-            # Use name + repository for stable identity
-            name = data.get("name", "")
-            repo = data.get("repository", {})
-            if isinstance(repo, dict):
-                repo = repo.get("url", "")
-            return f"npm:{name}:{repo}" if name else None
+    # 1. Git remote (highest priority)
+    git_url = get_git_remote_url(resolved_path)
+    if git_url:
+        # Extract repo name from URL (e.g., "github.com/user/repo" -> "repo")
+        repo_name = git_url.split("/")[-1] if "/" in git_url else git_url
+        suggestions.append(
+            ProjectNameSuggestion(name=repo_name, source="git_remote", confidence=95)
+        )
 
-        elif marker == "pyproject.toml":
-            # Simple TOML parsing for name field
+    # 2. pyproject.toml
+    pyproject_path = resolved_path / "pyproject.toml"
+    if pyproject_path.exists():
+        try:
             import tomllib
-            data = tomllib.loads(text)
-            name = data.get("project", {}).get("name") or data.get("tool", {}).get("poetry", {}).get("name")
-            return f"pypi:{name}" if name else None
 
-        elif marker == "Cargo.toml":
-            # Simple TOML parsing for package name
+            with open(pyproject_path, "rb") as f:
+                data = tomllib.load(f)
+            name = data.get("project", {}).get("name")
+            if not name:
+                name = data.get("tool", {}).get("poetry", {}).get("name")
+            if name:
+                suggestions.append(
+                    ProjectNameSuggestion(name=name, source="pyproject", confidence=85)
+                )
+        except Exception as e:
+            log.debug(f"Failed to parse pyproject.toml: {e}")
+
+    # 3. package.json
+    package_json_path = resolved_path / "package.json"
+    if package_json_path.exists():
+        try:
+            with open(package_json_path, encoding="utf-8") as f:
+                data = json.load(f)
+            name = data.get("name")
+            if name:
+                # Strip org prefix if present (e.g., "@org/package" -> "package")
+                if name.startswith("@") and "/" in name:
+                    name = name.split("/")[-1]
+                suggestions.append(
+                    ProjectNameSuggestion(name=name, source="package_json", confidence=80)
+                )
+        except Exception as e:
+            log.debug(f"Failed to parse package.json: {e}")
+
+    # 4. Cargo.toml
+    cargo_path = resolved_path / "Cargo.toml"
+    if cargo_path.exists():
+        try:
             import tomllib
-            data = tomllib.loads(text)
+
+            with open(cargo_path, "rb") as f:
+                data = tomllib.load(f)
             name = data.get("package", {}).get("name")
-            return f"cargo:{name}" if name else None
+            if name:
+                suggestions.append(
+                    ProjectNameSuggestion(name=name, source="cargo", confidence=80)
+                )
+        except Exception as e:
+            log.debug(f"Failed to parse Cargo.toml: {e}")
 
-        elif marker == "go.mod":
-            # Extract module path from first line
-            for line in text.split("\n"):
+    # 5. go.mod
+    gomod_path = resolved_path / "go.mod"
+    if gomod_path.exists():
+        try:
+            content = gomod_path.read_text(encoding="utf-8")
+            for line in content.split("\n"):
                 if line.startswith("module "):
-                    module = line.split(" ", 1)[1].strip()
-                    return f"go:{module}"
-            return None
+                    module_path = line.split(" ", 1)[1].strip()
+                    # Extract last component (e.g., "github.com/user/repo" -> "repo")
+                    name = module_path.split("/")[-1]
+                    suggestions.append(
+                        ProjectNameSuggestion(name=name, source="go_mod", confidence=80)
+                    )
+                    break
+        except Exception as e:
+            log.debug(f"Failed to parse go.mod: {e}")
 
-        elif marker == "pom.xml":
-            # Extract groupId:artifactId from XML
-            group = re.search(r"<groupId>([^<]+)</groupId>", text)
-            artifact = re.search(r"<artifactId>([^<]+)</artifactId>", text)
-            if group and artifact:
-                return f"maven:{group.group(1)}:{artifact.group(1)}"
-            return None
+    # 6. Directory name (fallback, lowest confidence)
+    dir_name = resolved_path.name
+    if dir_name and dir_name not in [".", "..", ""]:
+        suggestions.append(
+            ProjectNameSuggestion(name=dir_name, source="directory", confidence=50)
+        )
 
-    except Exception as e:
-        log.debug(f"Failed to parse {marker} for stable identity: {e}")
+    # Sort by confidence (highest first) and dedupe by name
+    seen_names: set[str] = set()
+    unique_suggestions: list[ProjectNameSuggestion] = []
+    for s in sorted(suggestions, key=lambda x: -x.confidence):
+        if s.name not in seen_names:
+            seen_names.add(s.name)
+            unique_suggestions.append(s)
 
-    return None
-
-
-def hash_project_markers(path: Path) -> str | None:
-    """Generate hash from stable identity fields in project marker files.
-
-    Extracts only stable fields (name, repository) from marker files,
-    ignoring version numbers and dependencies that change frequently.
-    Falls back to full content hash if parsing fails.
-
-    Args:
-        path: Project root directory
-
-    Returns:
-        SHA256 hash prefix (16 chars) or None if no markers found
-    """
-    for marker in PROJECT_MARKERS:
-        marker_path = path / marker
-        if marker_path.exists():
-            try:
-                content = marker_path.read_bytes()
-
-                # Try to extract stable identity first
-                stable_identity = _extract_stable_identity(marker, content)
-                if stable_identity:
-                    hash_digest = hashlib.sha256(stable_identity.encode()).hexdigest()[:16]
-                    log.debug(f"Hashed stable identity from {marker}: {stable_identity} -> {hash_digest}")
-                    return hash_digest
-
-                # Fallback to full content hash (less stable but still works)
-                hash_digest = hashlib.sha256(content).hexdigest()[:16]
-                log.debug(f"Hashed full content of {marker}: {hash_digest}")
-                return hash_digest
-
-            except IOError as e:
-                log.debug(f"Failed to read {marker_path}: {e}")
-                continue
-
-    return None
+    return unique_suggestions
 
 
-class ProjectIdError(Exception):
-    """Raised when project ID cannot be determined."""
+def create_bootstrap_config(
+    path: str | Path,
+    project_name: str,
+    project_id: str | None = None,
+    folder_role: str | None = None,
+    force: bool = False,
+) -> tuple[Path, SimpleMemConfig]:
+    """Create .simplemem.yaml config file for a project.
 
-    def __init__(self, path: Path, message: str, suggestion: str):
-        self.path = path
-        self.message = message
-        self.suggestion = suggestion
-        super().__init__(f"{message}\n\nSuggestion: {suggestion}")
-
-
-def get_project_id(path: str | Path, strict: bool = False) -> str:
-    """Generate hierarchical project ID using deterministic strategies.
-
-    Tries strategies in order of stability:
-    1. Git remote URL (most stable, cross-machine) - PREFERRED
-    2. Config file (.simplemem.yaml) - walk up directories
-    3. Content hash of project markers - DEPRECATED, logs warning
-    4. Resolved absolute path - DEPRECATED, logs warning
+    Performs atomic write (tmp + rename) to avoid partial writes.
 
     Args:
-        path: Project root path (absolute or relative)
-        strict: If True, raise ProjectIdError instead of falling back to
-                deprecated hash/path strategies. Use strict=True for new code.
+        path: Directory where to create the config
+        project_name: Human-readable project name
+        project_id: Explicit project_id (default: "config:{project_name}")
+        folder_role: Optional role ("source", "tests", "docs", etc.)
+        force: Overwrite existing config if True
 
     Returns:
-        Project ID with format prefix (git:, config:, hash:, path:)
+        Tuple of (config_path, SimpleMemConfig)
 
     Raises:
-        ProjectIdError: If strict=True and no git remote or config found
-
-    Examples:
-        >>> get_project_id("/repo/myproject")  # with git remote
-        'git:github.com/user/myproject'
-        >>> get_project_id("/repo/myproject")  # with .simplemem.yaml
-        'config:mycompany/myproject'
-        >>> get_project_id("/repo/myproject", strict=True)  # no git/config
-        ProjectIdError: No project ID found. Create .simplemem.yaml...
+        FileExistsError: If config exists and force=False
+        ValueError: If project_name/project_id validation fails
     """
     resolved_path = Path(path).expanduser().resolve()
 
-    # Strategy 1: Git remote URL (most stable)
-    git_url = get_git_remote_url(resolved_path)
-    if git_url:
-        return f"git:{git_url}"
+    # Generate project_id if not provided
+    if project_id is None:
+        # Sanitize project name for ID (lowercase, replace spaces/special chars)
+        slug = project_name.lower()
+        slug = re.sub(r"[^a-z0-9/_-]", "-", slug)
+        slug = re.sub(r"-+", "-", slug).strip("-")
+        project_id = f"config:{slug}"
 
-    # Strategy 2: Walk up directories to find config file (.simplemem.yaml or .simplemem.json)
-    config_result = find_config_file(resolved_path)
-    if config_result:
-        config_dir, config = config_result
-        project_id = config["project_id"]
-        # Add config: prefix if not already prefixed
-        if not any(project_id.startswith(p) for p in ["git:", "uuid:", "config:", "hash:", "path:"]):
-            project_id = f"config:{project_id}"
-        return project_id
-
-    # --- DEPRECATED FALLBACKS ---
-    # These are kept for backwards compatibility but will be removed.
-    # New code should use strict=True.
-
-    if strict:
-        raise ProjectIdError(
-            path=resolved_path,
-            message=f"No project ID found for: {resolved_path}",
-            suggestion=(
-                "Create a .simplemem.yaml file with:\n\n"
-                "  version: 1\n"
-                f"  project_id: \"{resolved_path.name}\"\n\n"
-                "Or initialize a git repository with a remote."
-            ),
-        )
-
-    # Strategy 3: Content hash (DEPRECATED)
-    content_hash = hash_project_markers(resolved_path)
-    if content_hash:
-        log.warning(
-            f"Using DEPRECATED hash-based project ID for {resolved_path}. "
-            "Hash IDs are brittle and will be removed in a future version. "
-            "Create .simplemem.yaml or add a git remote."
-        )
-        return f"hash:{content_hash}"
-
-    # Strategy 4: Fallback to resolved path (DEPRECATED)
-    log.warning(
-        f"Using DEPRECATED path-based project ID for {resolved_path}. "
-        "Path IDs are not portable. "
-        "Create .simplemem.yaml or add a git remote."
+    # Validate through Pydantic
+    config = SimpleMemConfig(
+        version=1,
+        project_id=project_id,
+        project_name=project_name,
+        folder_role=folder_role,
     )
-    return f"path:{resolved_path}"
+
+    config_path = resolved_path / ".simplemem.yaml"
+
+    # Check for existing config
+    if config_path.exists() and not force:
+        raise FileExistsError(
+            f"Config already exists at {config_path}. Use force=True to overwrite."
+        )
+
+    # Ensure parent directory exists
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Atomic write: write to temp file, then rename
+    import tempfile
+
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        suffix=".yaml", prefix=".simplemem-", dir=resolved_path
+    )
+    try:
+        # Build YAML content (manual to preserve formatting)
+        yaml_content = f"""# SimpleMem project configuration
+# See: https://github.com/shimonvainer/simplemem
+
+version: {config.version}
+project_id: "{config.project_id}"
+"""
+        if config.project_name:
+            yaml_content += f'project_name: "{config.project_name}"\n'
+        if config.folder_role:
+            yaml_content += f'folder_role: "{config.folder_role}"\n'
+
+        with open(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(yaml_content)
+
+        # Atomic rename
+        import os
+
+        os.replace(tmp_path, config_path)
+        log.info(f"Created bootstrap config at {config_path}")
+
+    except Exception:
+        # Clean up temp file on error
+        try:
+            Path(tmp_path).unlink()
+        except OSError:
+            pass
+        raise
+
+    return config_path, config
+
+
+def get_project_id(path: str | Path) -> str:
+    """Get project ID from .simplemem.yaml config (STRICT MODE).
+
+    IMPORTANT: This function ONLY returns config-based project IDs.
+    If no .simplemem.yaml is found, NotBootstrappedError is raised.
+
+    Projects MUST be bootstrapped before use. There are no fallbacks
+    to git:, hash:, or path: based IDs.
+
+    Args:
+        path: Project root path (absolute or relative)
+
+    Returns:
+        Project ID with "config:" prefix (e.g., "config:simplemem")
+
+    Raises:
+        NotBootstrappedError: If no .simplemem.yaml found in path or parents
+
+    Examples:
+        >>> get_project_id("/repo/myproject")  # with .simplemem.yaml
+        'config:mycompany/myproject'
+        >>> get_project_id("/repo/not-bootstrapped")
+        NotBootstrappedError: Project not bootstrapped...
+    """
+    # find_project_root() raises NotBootstrappedError if no config found
+    _, config = find_project_root(path)
+    return config.project_id
 
 
 def parse_project_id(project_id: str) -> tuple[str, str]:
@@ -511,11 +636,18 @@ def decode_claude_path(encoded_path: str) -> str | None:
 def infer_project_from_session_path(session_path: Path) -> str | None:
     """Infer project_id from a Claude trace file path.
 
+    IMPORTANT: This function only returns project_id if the decoded path
+    has a valid .simplemem.yaml config. Sessions from non-bootstrapped
+    projects are skipped.
+
     Args:
         session_path: Path to the session trace file
 
     Returns:
-        Project ID with proper prefix, or None if inference fails
+        Project ID with "config:" prefix, or None if:
+        - Path cannot be decoded
+        - Decoded path doesn't exist locally
+        - Project is not bootstrapped (no .simplemem.yaml)
     """
     try:
         # The parent directory name is the encoded project path
@@ -525,12 +657,16 @@ def infer_project_from_session_path(session_path: Path) -> str | None:
         if decoded_path:
             resolved = Path(decoded_path).resolve()
             if resolved.exists():
-                # Path exists locally - use full hierarchical ID generation
-                return get_project_id(resolved)
+                try:
+                    # Path exists - try to get config-based project_id
+                    return get_project_id(resolved)
+                except NotBootstrappedError:
+                    log.debug(f"Session path {decoded_path} is not bootstrapped, skipping")
+                    return None
             else:
-                # Path doesn't exist locally - return as path: prefix
+                # Path doesn't exist locally - can't process
                 log.debug(f"Decoded path doesn't exist locally: {decoded_path}")
-                return f"path:{decoded_path}"
+                return None
 
         return None
     except Exception as e:
