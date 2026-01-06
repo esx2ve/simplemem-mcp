@@ -323,15 +323,16 @@ class LocalReader:
 
         # Check built-in exclusions first (pre-compiled pathspec)
         if _BUILTIN_SPEC.match_file(path_str):
-            # Find which pattern matched for the reason
+            # Use simple heuristic to identify matching pattern (avoids PathSpec creation)
             for pattern in SKIP_DIRS:
-                single_spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern])
-                if single_spec.match_file(path_str):
-                    return True, f"built-in: {pattern.rstrip('/')}"
+                pattern_base = pattern.rstrip("/")
+                if pattern_base in path_str or (
+                    pattern_base.startswith("*") and path_str.endswith(pattern_base[1:])
+                ):
+                    return True, f"built-in: {pattern_base}"
             return True, "built-in"
 
         # Check hidden directories (not files - allow .github/, .storybook/, etc.)
-        # Only exclude hidden dirs that aren't in the path being matched
         for part in file_path.parts[:-1]:  # Exclude the filename itself
             if part.startswith(".") and part not in {".github", ".storybook", ".circleci"}:
                 return True, f"hidden_dir: {part}"
@@ -340,14 +341,98 @@ class LocalReader:
         if ignore_patterns:
             user_spec = self._get_ignore_spec(ignore_patterns)
             if user_spec and user_spec.match_file(path_str):
-                # Find which pattern matched for the reason
+                # Use simple heuristic for reason (avoids PathSpec creation per pattern)
                 for pattern in ignore_patterns:
-                    single_spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern])
-                    if single_spec.match_file(path_str):
+                    pattern_base = pattern.rstrip("/").lstrip("**/")
+                    if pattern_base in path_str or file_path.name == pattern_base:
                         return True, f"ignore_patterns: {pattern}"
                 return True, "ignore_patterns"
 
         return False, None
+
+    def _scan_files_internal(
+        self,
+        directory: Path,
+        patterns: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
+        max_files: int = 1000,
+        max_file_size_kb: int = 500,
+        read_content: bool = True,
+    ) -> Iterator[tuple[Path, Path, dict | None]]:
+        """Internal generator for file scanning (shared by scan_code_files and dry_run_scan).
+
+        Args:
+            directory: Directory to scan
+            patterns: Glob patterns to match (default: code_patterns)
+            ignore_patterns: Gitignore-style patterns to exclude
+            max_files: Maximum files to yield
+            max_file_size_kb: Skip files larger than this
+            read_content: If True, read file content; if False, just validate
+
+        Yields:
+            Tuples of (abs_path, rel_path, exclusion_info) where:
+            - exclusion_info is None if file should be indexed
+            - exclusion_info is {"reason": str} if file should be excluded
+        """
+        patterns = patterns or self.code_patterns
+        directory = Path(directory)
+
+        if not directory.exists():
+            log.warning(f"Directory does not exist: {directory}")
+            return
+
+        # Collect unique files from all patterns
+        found_paths: set[Path] = set()
+        for pattern in patterns:
+            for file_path in directory.glob(pattern):
+                if file_path.is_file():
+                    found_paths.add(file_path)
+
+        file_count = 0
+        max_size_bytes = max_file_size_kb * 1024
+
+        for file_path in sorted(found_paths):
+            rel_path = file_path.relative_to(directory)
+
+            # Check exclusions
+            is_excluded, reason = self._is_excluded_path(rel_path, ignore_patterns)
+            if is_excluded:
+                yield file_path, rel_path, {"reason": reason}
+                continue
+
+            # Check file size
+            try:
+                stat = file_path.stat()
+                size_kb = stat.st_size / 1024
+                if stat.st_size > max_size_bytes:
+                    yield file_path, rel_path, {"reason": f"too_large: {size_kb:.1f}KB > {max_file_size_kb}KB"}
+                    continue
+            except OSError as e:
+                yield file_path, rel_path, {"reason": f"stat_error: {e}"}
+                continue
+
+            # Check readability (read content if requested)
+            if read_content:
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                    yield file_path, rel_path, None  # Success - caller will read content
+                except (UnicodeDecodeError, OSError) as e:
+                    yield file_path, rel_path, {"reason": f"unreadable: {e}"}
+                    continue
+            else:
+                # Just check if readable without reading full content
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        f.read(1)
+                    yield file_path, rel_path, None  # Success
+                except (UnicodeDecodeError, OSError):
+                    yield file_path, rel_path, {"reason": "unreadable: encoding or permission error"}
+                    continue
+
+            file_count += 1
+            if file_count >= max_files:
+                log.info(f"Reached max_files limit ({max_files})")
+                return
 
     def scan_code_files(
         self,
@@ -369,58 +454,16 @@ class LocalReader:
         Yields:
             Dicts with path and content for each file
         """
-        patterns = patterns or self.code_patterns
-        directory = Path(directory)
-
-        if not directory.exists():
-            log.warning(f"Directory does not exist: {directory}")
-            return
-
-        # Collect unique files from all patterns to avoid duplicates
-        found_paths: set[Path] = set()
-        for pattern in patterns:
-            for file_path in directory.glob(pattern):
-                if file_path.is_file():
-                    found_paths.add(file_path)
-
-        file_count = 0
-        max_size_bytes = max_file_size_kb * 1024
-
-        # Sort for deterministic order
-        for file_path in sorted(found_paths):
-            # Get relative path for pattern matching
-            rel_path = file_path.relative_to(directory)
-
-            # Skip hidden and excluded directories using fnmatch
-            is_excluded, _ = self._is_excluded_path(rel_path, ignore_patterns)
-            if is_excluded:
-                continue
-
-            # Check file size
-            try:
-                stat = file_path.stat()
-                if stat.st_size > max_size_bytes:
-                    log.debug(f"Skipping large file: {file_path} ({stat.st_size // 1024}KB)")
+        for file_path, rel_path, exclusion in self._scan_files_internal(
+            directory, patterns, ignore_patterns, max_files, max_file_size_kb, read_content=True
+        ):
+            if exclusion is None:
+                # File passed all checks - read and yield content
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                    yield {"path": str(rel_path), "content": content}
+                except (UnicodeDecodeError, OSError):
                     continue
-            except OSError:
-                continue
-
-            # Read content
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError) as e:
-                log.debug(f"Skipping unreadable file {file_path}: {e}")
-                continue
-
-            yield {
-                "path": str(rel_path),
-                "content": content,
-            }
-
-            file_count += 1
-            if file_count >= max_files:
-                log.warning(f"Reached max_files limit ({max_files})")
-                return
 
     def read_code_files(
         self,
@@ -473,10 +516,6 @@ class LocalReader:
         patterns = patterns or self.code_patterns
         directory = Path(directory)
 
-        would_index: list[dict] = []
-        excluded: list[dict] = []
-        total_size_bytes = 0
-
         if not directory.exists():
             return {
                 "dry_run": True,
@@ -493,67 +532,26 @@ class LocalReader:
                 },
             }
 
-        # Collect unique files from all patterns to avoid duplicates
-        found_paths: set[Path] = set()
-        for pattern in patterns:
-            for file_path in directory.glob(pattern):
-                if file_path.is_file():
-                    found_paths.add(file_path)
+        would_index: list[dict] = []
+        excluded: list[dict] = []
+        total_size_bytes = 0
 
-        max_size_bytes = max_file_size_kb * 1024
-
-        # Sort for deterministic order
-        for file_path in sorted(found_paths):
-            rel_path = file_path.relative_to(directory)
-
-            # Check exclusions
-            is_excluded, reason = self._is_excluded_path(rel_path, ignore_patterns)
-            if is_excluded:
-                excluded.append({
-                    "path": str(rel_path),
-                    "reason": reason,
-                })
-                continue
-
-            # Check file size
-            try:
-                stat = file_path.stat()
-                size_kb = stat.st_size / 1024
-
-                if stat.st_size > max_size_bytes:
-                    excluded.append({
-                        "path": str(rel_path),
-                        "reason": f"too_large: {size_kb:.1f}KB > {max_file_size_kb}KB",
-                    })
-                    continue
-
-                # Check if readable
+        for file_path, rel_path, exclusion in self._scan_files_internal(
+            directory, patterns, ignore_patterns, max_files, max_file_size_kb, read_content=False
+        ):
+            if exclusion is not None:
+                excluded.append({"path": str(rel_path), "reason": exclusion["reason"]})
+            else:
+                # File passed all checks
                 try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        f.read(1)  # Just check if readable
-                except (UnicodeDecodeError, OSError):
-                    excluded.append({
+                    size_bytes = file_path.stat().st_size
+                    would_index.append({
                         "path": str(rel_path),
-                        "reason": "unreadable: encoding or permission error",
+                        "size_kb": round(size_bytes / 1024, 1),
                     })
-                    continue
-
-                would_index.append({
-                    "path": str(rel_path),
-                    "size_kb": round(size_kb, 1),
-                })
-                total_size_bytes += stat.st_size
-
-                if len(would_index) >= max_files:
-                    log.info(f"Dry run reached max_files limit ({max_files})")
-                    break
-
-            except OSError as e:
-                excluded.append({
-                    "path": str(rel_path),
-                    "reason": f"stat_error: {e}",
-                })
-                continue
+                    total_size_bytes += size_bytes
+                except OSError:
+                    pass  # Already checked in _scan_files_internal
 
         return {
             "dry_run": True,
