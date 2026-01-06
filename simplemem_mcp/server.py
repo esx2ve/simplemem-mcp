@@ -1166,14 +1166,49 @@ async def index_directory(
             dry_run=True
         )
 
+    BOOTSTRAP PROTOCOL (MANDATORY for first-time indexing):
+        When indexing a new project for the first time, ALWAYS use dry_run first
+        to validate what will be indexed and catch potential issues:
+
+        # Step 1: Preview what would be indexed
+        preview = index_directory(path=".", dry_run=True)
+
+        # Step 2: Check the results - look for red flags:
+        # - Too many files (>500) may indicate missing ignore_patterns
+        # - Unexpected directories (vendor/, generated/, etc.)
+        # - Large files that shouldn't be indexed
+        # - Files from dependencies being included
+
+        # Step 3: If suspicious, ASK THE USER before proceeding:
+        # "I found {N} files to index. Some concerns:
+        #  - {list unexpected patterns}
+        #  Should I proceed, or would you like to add ignore_patterns?"
+
+        # Step 4: Only after validation, run the actual index
+        index_directory(path=".", ignore_patterns=[...])
+
+    SUSPICIOUS PATTERNS TO WATCH FOR:
+        - files_to_index > 500: May need more ignore_patterns
+        - vendor/, third_party/, external/: Should typically be excluded
+        - *.min.js, *.bundle.js: Generated files, exclude them
+        - **/fixtures/**, **/testdata/**: Test fixtures, often large
+        - Any path with node_modules, .venv, dist, build (auto-excluded)
+
     WORKFLOW:
-        # 1. Index the codebase
+        # 1. ALWAYS start with dry_run for new projects
+        preview = index_directory(path=".", dry_run=True)
+
+        # 2. Review and adjust if needed
+        if preview["summary"]["files_to_index"] > 500:
+            # Ask user about adding ignore_patterns
+
+        # 3. Index the codebase
         result = index_directory(path=".")
 
-        # 2. Check progress (for background jobs)
+        # 4. Check progress (for background jobs)
         job_status(job_id=result["job_id"])
 
-        # 3. Now search_code will work
+        # 5. Now search_code will work
         search_code(query="authentication handler")
 
     Args:
