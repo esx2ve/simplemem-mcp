@@ -863,6 +863,135 @@ async def cancel_job(job_id: str) -> dict:
         return {"error": e.detail, "cancelled": False}
 
 
+@mcp.tool()
+async def process_trace_batch(
+    sessions: list[dict],
+    max_concurrent: int = 3,
+) -> dict:
+    """Process MULTIPLE session traces - the preferred way to index many sessions.
+
+    WHEN TO USE (prefer this over process_trace for multiple sessions):
+    - Indexing historical sessions after discover_sessions()
+    - Batch processing sessions from the last N days
+    - Regular maintenance to index all unprocessed sessions
+
+    HOW IT WORKS:
+    1. Accepts session dicts directly from discover_sessions() output
+    2. Reads local trace files for each session
+    3. Compresses and sends to backend for processing
+    4. Returns job IDs for progress tracking via job_status()
+
+    WORKFLOW:
+        # Discover unindexed sessions from last 7 days
+        sessions = discover_sessions(days_back=7, include_indexed=False)
+
+        # Process them all in batch
+        result = process_trace_batch(sessions=sessions["sessions"])
+
+        # Check individual job progress
+        for session_id, job_id in result["job_ids"].items():
+            status = job_status(job_id)
+
+    Args:
+        sessions: List of session dicts with 'session_id' and 'path' keys
+                  (as returned by discover_sessions)
+        max_concurrent: Maximum concurrent jobs (default: 3, max effective: 30 sessions)
+
+    Returns:
+        {
+            "queued": ["session-id-1", "session-id-2", ...],
+            "errors": [{"session_id": "...", "error": "..."}],
+            "job_ids": {"session-id-1": "job-uuid-1", ...},
+            "total_requested": <count>
+        }
+    """
+    from simplemem_mcp.compression import compress_if_large
+
+    log.info(f"process_trace_batch called with {len(sessions)} sessions")
+
+    # Validate batch size to prevent silent data loss
+    batch_limit = max_concurrent * 10
+    if len(sessions) > batch_limit:
+        return {
+            "queued": [],
+            "errors": [{"session_id": "batch", "error": f"Batch size {len(sessions)} exceeds limit of {batch_limit}. Process in smaller batches."}],
+            "job_ids": {},
+            "total_requested": len(sessions),
+        }
+
+    reader = await _get_reader()
+    client = await _get_client()
+
+    # Prepare trace inputs for backend
+    traces = []
+    local_errors = []
+
+    for session in sessions:
+        session_id = session.get("session_id")
+        session_path = session.get("path")
+
+        if not session_id:
+            local_errors.append({"session_id": session_id, "error": "Missing session_id"})
+            continue
+
+        if not session_path:
+            # Try to find the path
+            session_path = await asyncio.to_thread(reader.find_session_path, session_id)
+            if session_path is None:
+                local_errors.append({"session_id": session_id, "error": "Session path not found"})
+                continue
+
+        try:
+            # Read trace content
+            trace_content = await asyncio.to_thread(reader.read_trace_file_by_path, session_path)
+            if trace_content is None:
+                local_errors.append({"session_id": session_id, "error": "Failed to read trace file"})
+                continue
+
+            # Compress the trace content
+            compressed, was_compressed = compress_if_large(trace_content, threshold_bytes=4096)
+
+            traces.append({
+                "session_id": session_id,
+                "trace_content": compressed,
+                "compressed": was_compressed,
+            })
+
+        except Exception as e:
+            log.error(f"Error reading session {session_id}: {e}")
+            local_errors.append({"session_id": session_id, "error": str(e)})
+
+    if not traces:
+        return {
+            "queued": [],
+            "errors": local_errors,
+            "job_ids": {},
+            "total_requested": len(sessions),
+        }
+
+    try:
+        # Send batch to backend
+        result = await client.process_trace_batch(traces=traces, max_concurrent=max_concurrent)
+
+        # Merge local errors with backend errors
+        all_errors = local_errors + result.get("errors", [])
+
+        return {
+            "queued": result.get("queued", []),
+            "errors": all_errors,
+            "job_ids": result.get("job_ids", {}),
+            "total_requested": len(sessions),
+        }
+    except BackendError as e:
+        log.error(f"process_trace_batch backend call failed: {e}")
+        return {
+            "queued": [],
+            "errors": local_errors + [{"session_id": "batch", "error": e.detail}],
+            "job_ids": {},
+            "total_requested": len(sessions),
+        }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CODE TOOLS
 # ═══════════════════════════════════════════════════════════════════════════════

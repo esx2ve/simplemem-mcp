@@ -253,6 +253,23 @@ class BackendClient:
             data["project_id"] = project_id
         return await self._request("POST", "/api/v1/traces/process", json_data=data)
 
+    async def process_trace_batch(
+        self,
+        traces: list[dict],
+        max_concurrent: int = 3,
+    ) -> dict:
+        """Process multiple traces via backend batch API.
+
+        Args:
+            traces: List of dicts with session_id, trace_content, compressed
+            max_concurrent: Max concurrent processing (default: 3)
+
+        Returns:
+            {queued: [...], errors: [...], job_ids: {...}}
+        """
+        data = {"traces": traces, "max_concurrent": max_concurrent}
+        return await self._request("POST", "/api/v1/traces/process-batch", json_data=data)
+
     async def get_job_status(self, job_id: str) -> dict:
         """Get status of a background processing job."""
         return await self._request("GET", f"/api/v1/traces/job/{job_id}")
