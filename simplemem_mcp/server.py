@@ -1098,8 +1098,10 @@ async def search_code(
 async def index_directory(
     path: str,
     patterns: list[str] | None = None,
+    ignore_patterns: list[str] | None = None,
     clear_existing: bool = True,
     background: bool = True,
+    dry_run: bool = False,
 ) -> dict:
     """Index a directory for semantic code search.
 
@@ -1147,6 +1149,23 @@ async def index_directory(
         result = index_directory(path=".", background=False)
         # Takes longer but returns stats immediately
 
+        # DRY RUN: Preview what files would be indexed
+        index_directory(path=".", dry_run=True)
+
+        # Exclude test files from indexing
+        index_directory(
+            path=".",
+            ignore_patterns=["*_test.py", "*.spec.ts", "test_*.py"]
+        )
+
+        # Combine patterns and dry run to verify filtering
+        index_directory(
+            path=".",
+            patterns=["**/*.py"],
+            ignore_patterns=["*_test.py", "conftest.py"],
+            dry_run=True
+        )
+
     WORKFLOW:
         # 1. Index the codebase
         result = index_directory(path=".")
@@ -1161,12 +1180,23 @@ async def index_directory(
         path: Directory to index. Can be absolute or relative.
         patterns: Glob patterns for files to include.
                   Default: ["**/*.py", "**/*.ts", "**/*.js", "**/*.tsx", "**/*.jsx"]
+        ignore_patterns: Gitignore-style patterns for files to exclude.
+                         Applied after patterns. Examples: ["*_test.py", "*.spec.ts"]
         clear_existing: Clear existing index for this project (default: True).
                         Set False to add files incrementally.
         background: Run in background (default: True). Large codebases
                     may take minutes; background prevents timeout.
+        dry_run: Preview mode (default: False). When True, returns list of
+                 files that would be indexed without actually indexing.
+                 Useful for verifying patterns and ignore_patterns work correctly.
 
     Returns:
+        If dry_run=True: {
+            "dry_run": True,
+            "would_index": [{"path": "...", "size_kb": ...}, ...],
+            "excluded": [{"path": "...", "reason": "..."}, ...],
+            "summary": {"files_to_index": N, "files_excluded": M, ...}
+        }
         If background=True: {"job_id": "...", "status": "submitted", "message": "..."}
         If background=False: {
             "files_indexed": 156,
@@ -1182,14 +1212,29 @@ async def index_directory(
 
         # Generate stable project_id
         project_id = generate_project_id(directory)
-        log.info(f"index_directory called (path={path}, project_id={project_id}, background={background})")
+        log.info(f"index_directory called (path={path}, project_id={project_id}, dry_run={dry_run}, background={background})")
+
+        reader = await _get_reader()
+
+        # DRY RUN: Preview what would be indexed without actually indexing
+        if dry_run:
+            result = await asyncio.to_thread(
+                reader.dry_run_scan,
+                directory,
+                patterns,
+                ignore_patterns,
+                1000,  # max_files
+                500,  # max_file_size_kb
+            )
+            result["project_id"] = project_id
+            return result
 
         # Read code files locally (offload blocking I/O to thread)
-        reader = await _get_reader()
         files = await asyncio.to_thread(
             reader.read_code_files,
             directory,
             patterns,
+            ignore_patterns,
             1000,  # max_files
             500,  # max_file_size_kb
         )

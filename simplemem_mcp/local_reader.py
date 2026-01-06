@@ -4,13 +4,14 @@ Reads files and traces from the local filesystem,
 preparing them for compression and transport to the backend API.
 """
 
-import fnmatch
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+import pathspec
 
 log = logging.getLogger("simplemem_mcp.local_reader")
 
@@ -29,23 +30,26 @@ DEFAULT_CODE_PATTERNS = [
     "**/*.jsx",
 ]
 
-# Directories to skip when scanning
-SKIP_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    "dist",
-    "build",
-    ".next",
-    "coverage",
-    ".tox",
-    "eggs",
-    "*.egg-info",
-}
+# Directories to skip when scanning (gitignore-style patterns)
+SKIP_DIRS = [
+    ".git/",
+    ".venv/",
+    "venv/",
+    "node_modules/",
+    "__pycache__/",
+    ".mypy_cache/",
+    ".pytest_cache/",
+    "dist/",
+    "build/",
+    ".next/",
+    "coverage/",
+    ".tox/",
+    "eggs/",
+    "*.egg-info/",
+]
+
+# Pre-compiled pathspec for built-in exclusions (built once at module load)
+_BUILTIN_SPEC = pathspec.PathSpec.from_lines("gitwildmatch", SKIP_DIRS)
 
 
 class LocalReader:
@@ -73,6 +77,8 @@ class LocalReader:
         """
         self.traces_dir = traces_dir or Path.home() / ".claude" / "projects"
         self.code_patterns = code_patterns or DEFAULT_CODE_PATTERNS
+        # Cache for user-provided ignore pattern specs (avoids rebuilding)
+        self._ignore_spec_cache: dict[tuple, pathspec.PathSpec] = {}
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # TRACE FILE OPERATIONS
@@ -283,29 +289,71 @@ class LocalReader:
     # CODE FILE OPERATIONS
     # ═══════════════════════════════════════════════════════════════════════════════
 
-    def _is_excluded_path(self, file_path: Path) -> bool:
-        """Check if a path should be excluded based on SKIP_DIRS patterns.
+    def _get_ignore_spec(
+        self, ignore_patterns: list[str] | None
+    ) -> pathspec.PathSpec | None:
+        """Get or create a cached pathspec for user ignore patterns."""
+        if not ignore_patterns:
+            return None
+        key = tuple(sorted(ignore_patterns))
+        if key not in self._ignore_spec_cache:
+            self._ignore_spec_cache[key] = pathspec.PathSpec.from_lines(
+                "gitwildmatch", ignore_patterns
+            )
+        return self._ignore_spec_cache[key]
+
+    def _is_excluded_path(
+        self,
+        file_path: Path,
+        ignore_patterns: list[str] | None = None,
+    ) -> tuple[bool, str | None]:
+        """Check if a path should be excluded based on SKIP_DIRS and ignore_patterns.
+
+        Uses pathspec with gitwildmatch semantics for proper gitignore-style matching.
+        Supports ** glob patterns and ! negation.
 
         Args:
-            file_path: Path to check
+            file_path: Path to check (should be relative to scan root)
+            ignore_patterns: Additional gitignore-style patterns to exclude
 
         Returns:
-            True if any path part matches a skip pattern
+            Tuple of (is_excluded, reason) where reason explains why if excluded
         """
-        for part in file_path.parts:
-            # Skip hidden directories/files
-            if part.startswith("."):
-                return True
-            # Check against skip patterns (supports glob patterns like *.egg-info)
-            for skip_pattern in SKIP_DIRS:
-                if fnmatch.fnmatch(part, skip_pattern):
-                    return True
-        return False
+        path_str = str(file_path)
+
+        # Check built-in exclusions first (pre-compiled pathspec)
+        if _BUILTIN_SPEC.match_file(path_str):
+            # Find which pattern matched for the reason
+            for pattern in SKIP_DIRS:
+                single_spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern])
+                if single_spec.match_file(path_str):
+                    return True, f"built-in: {pattern.rstrip('/')}"
+            return True, "built-in"
+
+        # Check hidden directories (not files - allow .github/, .storybook/, etc.)
+        # Only exclude hidden dirs that aren't in the path being matched
+        for part in file_path.parts[:-1]:  # Exclude the filename itself
+            if part.startswith(".") and part not in {".github", ".storybook", ".circleci"}:
+                return True, f"hidden_dir: {part}"
+
+        # Check user-provided ignore patterns with caching
+        if ignore_patterns:
+            user_spec = self._get_ignore_spec(ignore_patterns)
+            if user_spec and user_spec.match_file(path_str):
+                # Find which pattern matched for the reason
+                for pattern in ignore_patterns:
+                    single_spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern])
+                    if single_spec.match_file(path_str):
+                        return True, f"ignore_patterns: {pattern}"
+                return True, "ignore_patterns"
+
+        return False, None
 
     def scan_code_files(
         self,
         directory: Path,
         patterns: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
         max_files: int = 1000,
         max_file_size_kb: int = 500,
     ) -> Iterator[dict]:
@@ -314,6 +362,7 @@ class LocalReader:
         Args:
             directory: Directory to scan
             patterns: Glob patterns to match (default: code_patterns)
+            ignore_patterns: Gitignore-style patterns to exclude
             max_files: Maximum files to return
             max_file_size_kb: Skip files larger than this
 
@@ -339,8 +388,12 @@ class LocalReader:
 
         # Sort for deterministic order
         for file_path in sorted(found_paths):
+            # Get relative path for pattern matching
+            rel_path = file_path.relative_to(directory)
+
             # Skip hidden and excluded directories using fnmatch
-            if self._is_excluded_path(file_path):
+            is_excluded, _ = self._is_excluded_path(rel_path, ignore_patterns)
+            if is_excluded:
                 continue
 
             # Check file size
@@ -359,8 +412,6 @@ class LocalReader:
                 log.debug(f"Skipping unreadable file {file_path}: {e}")
                 continue
 
-            # Return relative path from directory
-            rel_path = file_path.relative_to(directory)
             yield {
                 "path": str(rel_path),
                 "content": content,
@@ -375,6 +426,7 @@ class LocalReader:
         self,
         directory: Path,
         patterns: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
         max_files: int = 1000,
         max_file_size_kb: int = 500,
     ) -> list[dict]:
@@ -383,6 +435,7 @@ class LocalReader:
         Args:
             directory: Directory to scan
             patterns: Glob patterns to match
+            ignore_patterns: Gitignore-style patterns to exclude
             max_files: Maximum files to return
             max_file_size_kb: Skip files larger than this
 
@@ -392,9 +445,129 @@ class LocalReader:
         return list(self.scan_code_files(
             directory=directory,
             patterns=patterns,
+            ignore_patterns=ignore_patterns,
             max_files=max_files,
             max_file_size_kb=max_file_size_kb,
         ))
+
+    def dry_run_scan(
+        self,
+        directory: Path,
+        patterns: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
+        max_files: int = 1000,
+        max_file_size_kb: int = 500,
+    ) -> dict:
+        """Preview what files would be indexed without reading content.
+
+        Args:
+            directory: Directory to scan
+            patterns: Glob patterns to match (default: code_patterns)
+            ignore_patterns: Gitignore-style patterns to exclude
+            max_files: Maximum files to return
+            max_file_size_kb: Skip files larger than this
+
+        Returns:
+            Dict with would_index, excluded, and summary info
+        """
+        patterns = patterns or self.code_patterns
+        directory = Path(directory)
+
+        would_index: list[dict] = []
+        excluded: list[dict] = []
+        total_size_bytes = 0
+
+        if not directory.exists():
+            return {
+                "dry_run": True,
+                "error": f"Directory does not exist: {directory}",
+                "would_index": [],
+                "excluded": [],
+                "summary": {
+                    "files_to_index": 0,
+                    "files_excluded": 0,
+                    "total_size_kb": 0,
+                    "patterns": patterns,
+                    "ignore_patterns": ignore_patterns or [],
+                    "built_in_excludes": sorted(SKIP_DIRS),
+                },
+            }
+
+        # Collect unique files from all patterns to avoid duplicates
+        found_paths: set[Path] = set()
+        for pattern in patterns:
+            for file_path in directory.glob(pattern):
+                if file_path.is_file():
+                    found_paths.add(file_path)
+
+        max_size_bytes = max_file_size_kb * 1024
+
+        # Sort for deterministic order
+        for file_path in sorted(found_paths):
+            rel_path = file_path.relative_to(directory)
+
+            # Check exclusions
+            is_excluded, reason = self._is_excluded_path(rel_path, ignore_patterns)
+            if is_excluded:
+                excluded.append({
+                    "path": str(rel_path),
+                    "reason": reason,
+                })
+                continue
+
+            # Check file size
+            try:
+                stat = file_path.stat()
+                size_kb = stat.st_size / 1024
+
+                if stat.st_size > max_size_bytes:
+                    excluded.append({
+                        "path": str(rel_path),
+                        "reason": f"too_large: {size_kb:.1f}KB > {max_file_size_kb}KB",
+                    })
+                    continue
+
+                # Check if readable
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        f.read(1)  # Just check if readable
+                except (UnicodeDecodeError, OSError):
+                    excluded.append({
+                        "path": str(rel_path),
+                        "reason": "unreadable: encoding or permission error",
+                    })
+                    continue
+
+                would_index.append({
+                    "path": str(rel_path),
+                    "size_kb": round(size_kb, 1),
+                })
+                total_size_bytes += stat.st_size
+
+                if len(would_index) >= max_files:
+                    log.info(f"Dry run reached max_files limit ({max_files})")
+                    break
+
+            except OSError as e:
+                excluded.append({
+                    "path": str(rel_path),
+                    "reason": f"stat_error: {e}",
+                })
+                continue
+
+        return {
+            "dry_run": True,
+            "would_index": would_index,
+            "excluded": excluded,
+            "summary": {
+                "files_to_index": len(would_index),
+                "files_excluded": len(excluded),
+                "total_size_kb": round(total_size_bytes / 1024, 1),
+                "patterns": patterns,
+                "ignore_patterns": ignore_patterns or [],
+                "built_in_excludes": sorted(SKIP_DIRS),
+            },
+        }
 
     def read_single_file(self, file_path: Path) -> str | None:
         """Read a single file's content.
