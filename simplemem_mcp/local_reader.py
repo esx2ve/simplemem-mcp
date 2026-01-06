@@ -52,6 +52,131 @@ SKIP_DIRS = [
 _BUILTIN_SPEC = pathspec.PathSpec.from_lines("gitwildmatch", SKIP_DIRS)
 
 
+def _aggregate_exclusions(excluded: list[dict]) -> dict:
+    """Aggregate file exclusions into category breakdown.
+
+    Args:
+        excluded: List of {"path": str, "reason": str} dicts
+
+    Returns:
+        Dict with counts and examples per exclusion category
+    """
+    categories: dict[str, dict] = {}
+
+    for item in excluded:
+        reason = item["reason"]
+        path = item["path"]
+
+        # Extract category (before colon)
+        category = reason.split(":")[0].strip()
+
+        if category not in categories:
+            categories[category] = {
+                "count": 0,
+                "top_folders": set(),
+                "examples": set(),
+            }
+
+        categories[category]["count"] += 1
+
+        # Extract top-level folder for built-in exclusions
+        parts = path.split("/")
+        if len(parts) > 0 and parts[0]:
+            top_folder = parts[0] + "/"
+            categories[category]["top_folders"].add(top_folder)
+
+        # Keep a few examples of the actual patterns/reasons
+        if len(categories[category]["examples"]) < 3:
+            # Extract the specific pattern from the reason
+            if ":" in reason:
+                specific = reason.split(":", 1)[1].strip()
+                categories[category]["examples"].add(specific)
+
+    # Convert sets to sorted lists for JSON serialization
+    result = {}
+    for cat, data in categories.items():
+        result[cat] = {"count": data["count"]}
+        if data["top_folders"]:
+            result[cat]["top_folders"] = sorted(data["top_folders"])[:5]
+        if data["examples"]:
+            result[cat]["examples"] = sorted(data["examples"])[:3]
+
+    return result
+
+
+def _aggregate_folders(excluded: list[dict]) -> list[dict]:
+    """Aggregate exclusions by top-level folder.
+
+    Args:
+        excluded: List of {"path": str, "reason": str} dicts
+
+    Returns:
+        List of folder summaries sorted by file count (descending)
+    """
+    folders: dict[str, dict] = {}
+
+    for item in excluded:
+        path = item["path"]
+        reason = item["reason"]
+
+        # Get top-level folder
+        parts = path.split("/")
+        if not parts[0]:
+            continue
+
+        folder = parts[0] + "/"
+        category = reason.split(":")[0].strip()
+
+        if folder not in folders:
+            folders[folder] = {
+                "folder": folder,
+                "reason": category,
+                "file_count": 0,
+            }
+        folders[folder]["file_count"] += 1
+
+    # Sort by file count descending
+    return sorted(folders.values(), key=lambda x: x["file_count"], reverse=True)
+
+
+def _save_full_report(
+    would_index: list[dict],
+    excluded: list[dict],
+    directory: Path,
+    summary: dict,
+) -> tuple[str, float]:
+    """Save complete dry_run report to /tmp/.
+
+    Args:
+        would_index: Files that would be indexed
+        excluded: Files that were excluded
+        directory: The scanned directory
+        summary: Summary statistics
+
+    Returns:
+        Tuple of (report_path, size_mb)
+    """
+    import time
+
+    timestamp = int(time.time())
+    project_name = Path(directory).name
+    report_path = Path("/tmp") / f"simplemem-dry-run-{project_name}-{timestamp}.json"
+
+    report = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "directory": str(directory),
+        "summary": summary,
+        "files_to_index": would_index,
+        "files_excluded": excluded,
+    }
+
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    size_mb = round(report_path.stat().st_size / (1024 * 1024), 2)
+    return str(report_path), size_mb
+
+
 class LocalReader:
     """Reads files and traces from local filesystem.
 
@@ -500,6 +625,7 @@ class LocalReader:
         ignore_patterns: list[str] | None = None,
         max_files: int = 1000,
         max_file_size_kb: int = 500,
+        verbosity: str = "minimal",
     ) -> dict:
         """Preview what files would be indexed without reading content.
 
@@ -509,9 +635,13 @@ class LocalReader:
             ignore_patterns: Gitignore-style patterns to exclude
             max_files: Maximum files to return
             max_file_size_kb: Skip files larger than this
+            verbosity: Output detail level:
+                "minimal" (default): ~2KB - summary + exclusion breakdown
+                "folders": ~5KB - folder-level aggregation
+                "full": Saves complete report to /tmp/, returns path
 
         Returns:
-            Dict with would_index, excluded, and summary info
+            Dict with summary and verbosity-appropriate details
         """
         patterns = patterns or self.code_patterns
         directory = Path(directory)
@@ -519,16 +649,12 @@ class LocalReader:
         if not directory.exists():
             return {
                 "dry_run": True,
+                "verbosity": verbosity,
                 "error": f"Directory does not exist: {directory}",
-                "would_index": [],
-                "excluded": [],
                 "summary": {
                     "files_to_index": 0,
                     "files_excluded": 0,
                     "total_size_kb": 0,
-                    "patterns": patterns,
-                    "ignore_patterns": ignore_patterns or [],
-                    "built_in_excludes": sorted(SKIP_DIRS),
                 },
             }
 
@@ -553,19 +679,40 @@ class LocalReader:
                 except OSError:
                     pass  # Already checked in _scan_files_internal
 
-        return {
-            "dry_run": True,
-            "would_index": would_index,
-            "excluded": excluded,
-            "summary": {
-                "files_to_index": len(would_index),
-                "files_excluded": len(excluded),
-                "total_size_kb": round(total_size_bytes / 1024, 1),
-                "patterns": patterns,
-                "ignore_patterns": ignore_patterns or [],
-                "built_in_excludes": sorted(SKIP_DIRS),
-            },
+        summary = {
+            "files_to_index": len(would_index),
+            "files_excluded": len(excluded),
+            "total_size_kb": round(total_size_bytes / 1024, 1),
         }
+
+        # Return different structures based on verbosity
+        if verbosity == "minimal":
+            return {
+                "dry_run": True,
+                "verbosity": "minimal",
+                "summary": summary,
+                "exclusion_breakdown": _aggregate_exclusions(excluded),
+            }
+
+        elif verbosity == "folders":
+            return {
+                "dry_run": True,
+                "verbosity": "folders",
+                "summary": summary,
+                "excluded_folders": _aggregate_folders(excluded),
+            }
+
+        else:  # "full"
+            report_path, size_mb = _save_full_report(
+                would_index, excluded, directory, summary
+            )
+            return {
+                "dry_run": True,
+                "verbosity": "full",
+                "summary": summary,
+                "report_path": report_path,
+                "report_size_mb": size_mb,
+            }
 
     def read_single_file(self, file_path: Path) -> str | None:
         """Read a single file's content.

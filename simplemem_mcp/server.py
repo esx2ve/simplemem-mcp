@@ -1102,6 +1102,7 @@ async def index_directory(
     clear_existing: bool = True,
     background: bool = True,
     dry_run: bool = False,
+    verbosity: str = "minimal",
 ) -> dict:
     """Index a directory for semantic code search.
 
@@ -1224,13 +1225,30 @@ async def index_directory(
         dry_run: Preview mode (default: False). When True, returns list of
                  files that would be indexed without actually indexing.
                  Useful for verifying patterns and ignore_patterns work correctly.
+        verbosity: Output detail level when dry_run=True (default: "minimal"):
+                   "minimal": ~2KB - compact summary + exclusion breakdown by category
+                   "folders": ~5KB - folder-level aggregation with file counts
+                   "full": Saves complete file list to /tmp/, returns path only
 
     Returns:
-        If dry_run=True: {
+        If dry_run=True (minimal): {
             "dry_run": True,
-            "would_index": [{"path": "...", "size_kb": ...}, ...],
-            "excluded": [{"path": "...", "reason": "..."}, ...],
-            "summary": {"files_to_index": N, "files_excluded": M, ...}
+            "verbosity": "minimal",
+            "summary": {"files_to_index": N, "files_excluded": M, "total_size_kb": X},
+            "exclusion_breakdown": {"built-in": {"count": N, "top_folders": [...]}, ...}
+        }
+        If dry_run=True (folders): {
+            "dry_run": True,
+            "verbosity": "folders",
+            "summary": {...},
+            "excluded_folders": [{"folder": ".venv/", "reason": "built-in", "file_count": N}, ...]
+        }
+        If dry_run=True (full): {
+            "dry_run": True,
+            "verbosity": "full",
+            "summary": {...},
+            "report_path": "/tmp/simplemem-dry-run-project-timestamp.json",
+            "report_size_mb": X.X
         }
         If background=True: {"job_id": "...", "status": "submitted", "message": "..."}
         If background=False: {
@@ -1260,6 +1278,7 @@ async def index_directory(
                 ignore_patterns,
                 1000,  # max_files
                 500,  # max_file_size_kb
+                verbosity,
             )
             result["project_id"] = project_id
             return result
