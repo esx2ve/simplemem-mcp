@@ -599,6 +599,198 @@ async def reason_memories(
 
 
 @mcp.tool()
+async def search_memories_deep(
+    query: str,
+    limit: int = 10,
+    rerank_pool: int = 20,
+    project_id: str | None = None,
+) -> dict:
+    """LLM-reranked semantic search with conflict detection.
+
+    PURPOSE: Higher quality search that uses an LLM to rerank results and
+    detect potential conflicts between memories. Use when precision matters
+    more than speed.
+
+    WHEN TO USE:
+    - When you need the most relevant results, not just similar ones
+    - When you want to detect conflicting information in memories
+    - For important decisions that need accurate context
+    - When basic search returns too many marginally relevant results
+
+    WHEN NOT TO USE:
+    - For quick lookups (use search_memories instead - faster)
+    - When you need many results quickly
+    - For simple fact retrieval
+
+    HOW IT WORKS:
+    1. Retrieves rerank_pool candidates via vector similarity
+    2. LLM reranks by semantic relevance to query
+    3. Returns top limit results with conflict detection
+    4. Conflicts are pairs of memories that contradict each other
+
+    Args:
+        query: Natural language search query
+        limit: Maximum results to return after reranking (default: 10)
+        rerank_pool: Number of candidates to consider for reranking (default: 20)
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+
+    Returns:
+        {
+            "results": [...],
+            "conflicts": [[uuid1, uuid2, "reason"], ...],
+            "rerank_applied": True/False
+        }
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    try:
+        log.info(f"search_memories_deep called (query='{query[:50]}...', project={resolved_project_id})")
+        client = await _get_client()
+        return await client.search_memories_deep(
+            query=query,
+            limit=limit,
+            rerank_pool=rerank_pool,
+            project_id=resolved_project_id,
+        )
+    except BackendError as e:
+        log.error(f"search_memories_deep failed: {e}")
+        return {"error": e.detail, "results": [], "conflicts": []}
+
+
+@mcp.tool()
+async def check_contradictions(
+    content: str,
+    memory_uuid: str | None = None,
+    apply_supersession: bool = False,
+    project_id: str | None = None,
+) -> dict:
+    """Check if content contradicts existing memories.
+
+    PURPOSE: Detect when new information conflicts with stored memories.
+    Optionally mark contradicted memories as superseded.
+
+    WHEN TO USE:
+    - Before storing important facts to check for conflicts
+    - When updating information that may invalidate old memories
+    - To find and resolve contradictory information in the knowledge base
+
+    HOW IT WORKS:
+    1. Searches for memories similar to the content
+    2. LLM analyzes for contradictions
+    3. Returns list of contradicting memories with confidence scores
+    4. Optionally creates SUPERSEDES relationships
+
+    Args:
+        content: The new content to check against existing memories
+        memory_uuid: UUID of the new memory (required if apply_supersession=True)
+        apply_supersession: Create SUPERSEDES edges from new memory to contradicted ones
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+
+    Returns:
+        {
+            "contradictions": [
+                {"memory_uuid": "...", "content": "...", "reason": "...", "confidence": 0.85},
+                ...
+            ],
+            "supersessions_created": 0
+        }
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    try:
+        log.info(f"check_contradictions called (content='{content[:50]}...', project={resolved_project_id})")
+        client = await _get_client()
+        return await client.check_contradictions(
+            content=content,
+            memory_uuid=memory_uuid,
+            apply_supersession=apply_supersession,
+            project_id=resolved_project_id,
+        )
+    except BackendError as e:
+        log.error(f"check_contradictions failed: {e}")
+        return {"error": e.detail, "contradictions": []}
+
+
+@mcp.tool()
+async def get_sync_health(project_id: str | None = None) -> dict:
+    """Check synchronization health between graph and vector stores.
+
+    PURPOSE: Detect orphaned memories that exist in one store but not the other.
+    Use to diagnose sync issues before running repair_sync.
+
+    Args:
+        project_id: Project to check. Auto-inferred from cwd if not specified.
+
+    Returns:
+        {
+            "graph_count": 100,
+            "vector_count": 98,
+            "missing_from_vector": ["uuid1", "uuid2"],
+            "missing_from_graph": [],
+            "is_healthy": False
+        }
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    try:
+        log.info(f"get_sync_health called (project={resolved_project_id})")
+        client = await _get_client()
+        return await client.get_sync_health(project_id=resolved_project_id)
+    except BackendError as e:
+        log.error(f"get_sync_health failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def repair_sync(
+    project_id: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Repair synchronization issues between graph and vector stores.
+
+    PURPOSE: Fix orphaned memories by backfilling missing embeddings or
+    graph nodes. Always run with dry_run=True first to preview changes.
+
+    Args:
+        project_id: Project to repair. Auto-inferred from cwd if not specified.
+        dry_run: Preview changes without applying (default: True)
+
+    Returns:
+        {
+            "dry_run": True,
+            "would_backfill": ["uuid1", "uuid2"],
+            "would_remove": [],
+            "backfilled": 0,
+            "removed": 0
+        }
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    try:
+        log.info(f"repair_sync called (project={resolved_project_id}, dry_run={dry_run})")
+        client = await _get_client()
+        return await client.repair_sync(
+            project_id=resolved_project_id,
+            dry_run=dry_run,
+        )
+    except BackendError as e:
+        log.error(f"repair_sync failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
 async def get_project_id(path: str | None = None) -> dict:
     """Get the canonical project_id from .simplemem.yaml config.
 

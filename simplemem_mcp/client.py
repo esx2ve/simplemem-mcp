@@ -228,6 +228,59 @@ class BackendClient:
         """Get memory store statistics."""
         return await self._request("GET", "/api/v1/memories/stats")
 
+    async def search_memories_deep(
+        self,
+        query: str,
+        limit: int = 10,
+        project_id: str | None = None,
+        rerank_pool: int = 20,
+    ) -> dict:
+        """LLM-reranked semantic search with conflict detection."""
+        data = {
+            "query": query,
+            "limit": limit,
+            "rerank_pool": rerank_pool,
+        }
+        if project_id:
+            data["project_id"] = project_id
+        return await self._request("POST", "/api/v1/memories/search-deep", json_data=data)
+
+    async def check_contradictions(
+        self,
+        content: str,
+        memory_uuid: str | None = None,
+        apply_supersession: bool = False,
+        project_id: str | None = None,
+    ) -> dict:
+        """Check if content contradicts existing memories."""
+        data = {
+            "content": content,
+            "apply_supersession": apply_supersession,
+        }
+        if memory_uuid:
+            data["memory_uuid"] = memory_uuid
+        if project_id:
+            data["project_id"] = project_id
+        return await self._request("POST", "/api/v1/memories/check-contradictions", json_data=data)
+
+    async def get_sync_health(self, project_id: str | None = None) -> dict:
+        """Check synchronization health between graph and vector stores."""
+        params = {}
+        if project_id:
+            params["project_id"] = project_id
+        return await self._request("GET", "/api/v1/memories/sync-health", params=params)
+
+    async def repair_sync(
+        self,
+        project_id: str | None = None,
+        dry_run: bool = True,
+    ) -> dict:
+        """Repair synchronization issues between graph and vector stores."""
+        data = {"dry_run": dry_run}
+        if project_id:
+            data["project_id"] = project_id
+        return await self._request("POST", "/api/v1/memories/repair-sync", json_data=data)
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # TRACES API
     # ═══════════════════════════════════════════════════════════════════════════════
