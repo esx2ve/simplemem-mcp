@@ -121,8 +121,12 @@ class BackendClient:
         path: str,
         json_data: dict | None = None,
         params: dict | None = None,
-    ) -> dict:
-        """Make an HTTP request to the backend."""
+    ) -> dict | str:
+        """Make an HTTP request to the backend.
+
+        Returns:
+            dict for JSON responses, str for plain text (TOON format)
+        """
         client = await self._get_client()
 
         try:
@@ -142,6 +146,11 @@ class BackendClient:
                 except Exception:
                     detail = response.text
                 raise BackendError(response.status_code, detail)
+
+            # Handle plain text responses (TOON format)
+            content_type = response.headers.get("content-type", "")
+            if "text/plain" in content_type:
+                return response.text
 
             return response.json()
 
@@ -176,13 +185,20 @@ class BackendClient:
         use_graph: bool = True,
         type_filter: str | None = None,
         project_id: str | None = None,
-    ) -> dict:
-        """Search memories via backend API."""
+        output_format: str | None = None,
+    ) -> dict | str:
+        """Search memories via backend API.
+
+        Returns:
+            dict with results for JSON format, str for TOON format
+        """
         data = {"query": query, "limit": limit, "use_graph": use_graph}
         if type_filter:
             data["type_filter"] = type_filter
         if project_id:
             data["project_id"] = project_id
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/memories/search", json_data=data)
 
     async def relate_memories(
@@ -404,12 +420,18 @@ class BackendClient:
         return await self._request("POST", "/api/v1/code/update", json_data=data)
 
     async def search_code(
-        self, query: str, limit: int = 10, project_id: str | None = None
-    ) -> dict:
+        self,
+        query: str,
+        limit: int = 10,
+        project_id: str | None = None,
+        output_format: str | None = None,
+    ) -> dict | str:
         """Search code via backend API."""
         data = {"query": query, "limit": limit}
         if project_id:
             data["project_id"] = project_id
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/code/search", json_data=data)
 
     async def code_stats(self, project_id: str | None = None) -> dict:

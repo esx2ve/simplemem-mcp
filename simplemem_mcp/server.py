@@ -253,7 +253,8 @@ async def search_memories(
     use_graph: bool = True,
     type_filter: str | None = None,
     project_id: str | None = None,
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """Hybrid search combining vector similarity and graph traversal.
 
     PURPOSE: Find relevant memories from past sessions using semantic search.
@@ -314,12 +315,12 @@ async def search_memories(
                      "decision", "pattern", "session_summary", "chunk_summary"
         project_id: Project isolation. Auto-inferred from cwd if not specified.
                     CRITICAL: Always use to prevent retrieving unrelated memories.
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "json" = structured dict, "toon" = tab-separated for token efficiency.
 
     Returns:
-        On success: {"results": [
-            {"uuid": "...", "content": "...", "type": "...", "score": 0.85, "created_at": "..."},
-            ...
-        ]}
+        TOON format (default): Tab-separated string for 30-60% token reduction
+        JSON format: {"results": [...]}
         On error: {"error": "...", "results": []}
     """
     try:
@@ -336,7 +337,11 @@ async def search_memories(
             use_graph=use_graph,
             type_filter=type_filter,
             project_id=resolved_project_id,
+            output_format=output_format,
         )
+        # TOON format returns raw string, JSON format returns dict
+        if isinstance(result, str):
+            return result
         return {"results": result.get("results", [])}
     except BackendError as e:
         log.error(f"search_memories failed: {e}")
@@ -1520,7 +1525,8 @@ async def search_code(
     limit: int = 10,
     project_id: str | None = None,
     project_root: str | None = None,  # Deprecated: use project_id
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """Search indexed code for implementations, patterns, and functionality.
 
     PURPOSE: Find relevant code snippets using semantic search. Unlike grep/ripgrep
@@ -1569,6 +1575,8 @@ async def search_code(
         project_id: Filter to specific project (preferred). Auto-inferred
                     from cwd if not specified.
         project_root: DEPRECATED - use project_id instead.
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "json" = structured dict, "toon" = tab-separated for token efficiency.
 
     Returns:
         On success: {
@@ -1600,11 +1608,16 @@ async def search_code(
     try:
         log.info(f"search_code called (query='{query[:50]}...', project_id={resolved_project_id})")
         client = await _get_client()
-        return await client.search_code(
+        result = await client.search_code(
             query=query,
             limit=limit,
             project_id=resolved_project_id,
+            output_format=output_format,
         )
+        # TOON format returns raw string, JSON format returns dict
+        if isinstance(result, str):
+            return result
+        return {"results": result.get("results", [])}
     except BackendError as e:
         log.error(f"search_code failed: {e}")
         return {"error": e.detail, "results": []}
