@@ -250,7 +250,8 @@ class BackendClient:
         limit: int = 10,
         project_id: str | None = None,
         rerank_pool: int = 20,
-    ) -> dict:
+        output_format: str | None = None,
+    ) -> dict | str:
         """LLM-reranked semantic search with conflict detection."""
         data = {
             "query": query,
@@ -259,6 +260,8 @@ class BackendClient:
         }
         if project_id:
             data["project_id"] = project_id
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/memories/search-deep", json_data=data)
 
     async def check_contradictions(
@@ -267,7 +270,8 @@ class BackendClient:
         memory_uuid: str | None = None,
         apply_supersession: bool = False,
         project_id: str | None = None,
-    ) -> dict:
+        output_format: str | None = None,
+    ) -> dict | str:
         """Check if content contradicts existing memories."""
         data = {
             "content": content,
@@ -277,6 +281,8 @@ class BackendClient:
             data["memory_uuid"] = memory_uuid
         if project_id:
             data["project_id"] = project_id
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/memories/check-contradictions", json_data=data)
 
     async def get_sync_health(self, project_id: str | None = None) -> dict:
@@ -343,10 +349,14 @@ class BackendClient:
         """Get status of a background processing job."""
         return await self._request("GET", f"/api/v1/traces/job/{job_id}")
 
-    async def list_jobs(self, include_completed: bool = True, limit: int = 20) -> dict:
-        """List background jobs."""
-        params = {"include_completed": str(include_completed).lower(), "limit": limit}
-        return await self._request("GET", "/api/v1/traces/jobs", params=params)
+    async def list_jobs(
+        self, include_completed: bool = True, limit: int = 20, output_format: str | None = None
+    ) -> dict | str:
+        """List background jobs (uses POST for TOON support)."""
+        data = {"include_completed": include_completed, "limit": limit}
+        if output_format:
+            data["output_format"] = output_format
+        return await self._request("POST", "/api/v1/traces/jobs/list", json_data=data)
 
     async def cancel_job(self, job_id: str) -> dict:
         """Cancel a running background job."""
@@ -442,17 +452,21 @@ class BackendClient:
         return await self._request("GET", "/api/v1/code/stats", params=params)
 
     async def code_related_memories(
-        self, chunk_uuid: str, limit: int = 10
-    ) -> dict:
+        self, chunk_uuid: str, limit: int = 10, output_format: str | None = None
+    ) -> dict | str:
         """Find memories related to a code chunk via shared entities."""
         data = {"chunk_uuid": chunk_uuid, "limit": limit}
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/code/related-memories", json_data=data)
 
     async def memory_related_code(
-        self, memory_uuid: str, limit: int = 10
-    ) -> dict:
+        self, memory_uuid: str, limit: int = 10, output_format: str | None = None
+    ) -> dict | str:
         """Find code chunks related to a memory via shared entities."""
         data = {"memory_uuid": memory_uuid, "limit": limit}
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/code/related-code", json_data=data)
 
     async def update_code_index_status(

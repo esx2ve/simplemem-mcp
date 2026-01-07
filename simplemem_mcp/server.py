@@ -55,6 +55,24 @@ _client_lock = asyncio.Lock()
 _reader_lock = asyncio.Lock()
 _watcher_lock = asyncio.Lock()
 
+# Default output format from environment
+OUTPUT_FORMAT = os.environ.get("SIMPLEMEM_OUTPUT_FORMAT", "toon")
+
+
+def _to_toon(records: list[dict], headers: list[str]) -> str:
+    """Convert list of dicts to TOON (Token-Optimized Object Notation) format.
+
+    TOON uses tab-separated values with headers on the first line.
+    This achieves 30-60% token savings compared to JSON.
+    """
+    if not records:
+        return "\t".join(headers)
+    lines = ["\t".join(headers)]
+    for record in records:
+        values = [str(record.get(h, "")).replace("\t", " ").replace("\n", " ") for h in headers]
+        lines.append("\t".join(values))
+    return "\n".join(lines)
+
 
 async def _get_client() -> BackendClient:
     """Get or create the backend client (thread-safe)."""
@@ -316,7 +334,7 @@ async def search_memories(
         project_id: Project isolation. Auto-inferred from cwd if not specified.
                     CRITICAL: Always use to prevent retrieving unrelated memories.
         output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
-                       "json" = structured dict, "toon" = tab-separated for token efficiency.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         TOON format (default): Tab-separated string for 30-60% token reduction
@@ -609,7 +627,8 @@ async def search_memories_deep(
     limit: int = 10,
     rerank_pool: int = 20,
     project_id: str | None = None,
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """LLM-reranked semantic search with conflict detection.
 
     PURPOSE: Higher quality search that uses an LLM to rerank results and
@@ -638,6 +657,8 @@ async def search_memories_deep(
         limit: Maximum results to return after reranking (default: 10)
         rerank_pool: Number of candidates to consider for reranking (default: 20)
         project_id: Project isolation. Auto-inferred from cwd if not specified.
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         {
@@ -659,6 +680,7 @@ async def search_memories_deep(
             limit=limit,
             rerank_pool=rerank_pool,
             project_id=resolved_project_id,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"search_memories_deep failed: {e}")
@@ -671,7 +693,8 @@ async def check_contradictions(
     memory_uuid: str | None = None,
     apply_supersession: bool = False,
     project_id: str | None = None,
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """Check if content contradicts existing memories.
 
     PURPOSE: Detect when new information conflicts with stored memories.
@@ -693,6 +716,8 @@ async def check_contradictions(
         memory_uuid: UUID of the new memory (required if apply_supersession=True)
         apply_supersession: Create SUPERSEDES edges from new memory to contradicted ones
         project_id: Project isolation. Auto-inferred from cwd if not specified.
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         {
@@ -716,6 +741,7 @@ async def check_contradictions(
             memory_uuid=memory_uuid,
             apply_supersession=apply_supersession,
             project_id=resolved_project_id,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"check_contradictions failed: {e}")
@@ -1251,6 +1277,7 @@ async def discover_sessions(
     offset: int = 0,
     group_by: str | None = None,
     include_indexed: bool = True,
+    output_format: str | None = None,
 ) -> dict:
     """Discover available Claude Code sessions for potential indexing.
 
@@ -1263,6 +1290,8 @@ async def discover_sessions(
         offset: Number of sessions to skip for pagination (default: 0)
         group_by: Optional grouping - "project" or "date" (default: None, flat list)
         include_indexed: Include already-indexed sessions in results (default: True)
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         Dict containing:
@@ -1279,14 +1308,10 @@ async def discover_sessions(
         data = await asyncio.to_thread(reader.discover_sessions, days_back, limit, offset)
 
         sessions = data.get("sessions", [])
-        result = {
-            "sessions": sessions,
-            "total_count": data.get("total", len(sessions)),
-            "has_more": data.get("has_more", False),
-            "indexed_count": 0,
-            "unindexed_count": data.get("total", len(sessions)),
-        }
+        total_count = data.get("total", len(sessions))
+        has_more = data.get("has_more", False)
 
+        # Handle grouping (returns JSON - TOON doesn't support nested structures)
         if group_by == "project":
             grouped: dict[str, list] = {}
             for s in sessions:
@@ -1294,9 +1319,32 @@ async def discover_sessions(
                 if project not in grouped:
                     grouped[project] = []
                 grouped[project].append(s)
-            result["sessions"] = grouped
+            return {
+                "sessions": grouped,
+                "total_count": total_count,
+                "has_more": has_more,
+                "indexed_count": 0,
+                "unindexed_count": total_count,
+            }
 
-        return result
+        # Determine output format
+        fmt = output_format or OUTPUT_FORMAT
+        if fmt == "toon":
+            # Convert to TOON format
+            headers = ["session_id", "project", "size_kb", "modified", "path"]
+            toon_str = _to_toon(sessions, headers)
+            # Add metadata as comment line
+            meta = f"# total={total_count} has_more={has_more}"
+            return {"result": f"{meta}\n{toon_str}"}
+
+        # JSON format
+        return {
+            "sessions": sessions,
+            "total_count": total_count,
+            "has_more": has_more,
+            "indexed_count": 0,
+            "unindexed_count": total_count,
+        }
     except Exception as e:
         log.error(f"discover_sessions failed: {e}")
         return {"error": str(e), "sessions": [], "total_count": 0}
@@ -1329,12 +1377,15 @@ async def job_status(job_id: str) -> dict:
 async def list_jobs(
     include_completed: bool = True,
     limit: int = 20,
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """List all background jobs.
 
     Args:
         include_completed: Include completed/failed/cancelled jobs (default: True)
         limit: Maximum number of jobs to return (default: 20)
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         {jobs: [{id, type, status, progress, message}]}
@@ -1345,6 +1396,7 @@ async def list_jobs(
         return await client.list_jobs(
             include_completed=include_completed,
             limit=limit,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"list_jobs failed: {e}")
@@ -1576,7 +1628,7 @@ async def search_code(
                     from cwd if not specified.
         project_root: DEPRECATED - use project_id instead.
         output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
-                       "json" = structured dict, "toon" = tab-separated for token efficiency.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         On success: {
@@ -1887,7 +1939,8 @@ async def code_stats(
 async def code_related_memories(
     chunk_uuid: str,
     limit: int = 10,
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """Find memories related to a code chunk via shared entities.
 
     PURPOSE: Bridge between code and memories - discover debugging sessions,
@@ -1913,6 +1966,8 @@ async def code_related_memories(
     Args:
         chunk_uuid: UUID of the code chunk (from search_code results)
         limit: Maximum memories to return (default: 10)
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         {
@@ -1927,6 +1982,7 @@ async def code_related_memories(
         return await client.code_related_memories(
             chunk_uuid=chunk_uuid,
             limit=limit,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"code_related_memories failed: {e}")
@@ -1937,7 +1993,8 @@ async def code_related_memories(
 async def memory_related_code(
     memory_uuid: str,
     limit: int = 10,
-) -> dict:
+    output_format: str | None = None,
+) -> dict | str:
     """Find code chunks related to a memory via shared entities.
 
     PURPOSE: Bridge from memories to code - find implementations mentioned
@@ -1963,6 +2020,8 @@ async def memory_related_code(
     Args:
         memory_uuid: UUID of the memory (from search_memories results)
         limit: Maximum code chunks to return (default: 10)
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
         {
@@ -1977,6 +2036,7 @@ async def memory_related_code(
         return await client.memory_related_code(
             memory_uuid=memory_uuid,
             limit=limit,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"memory_related_code failed: {e}")
