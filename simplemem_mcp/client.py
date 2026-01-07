@@ -214,6 +214,7 @@ class BackendClient:
         max_memories: int = 8,
         max_hops: int = 2,
         project_id: str | None = None,
+        output_format: str | None = None,
     ) -> dict:
         """Ask a question with LLM-synthesized answer from memory graph."""
         data = {
@@ -222,6 +223,8 @@ class BackendClient:
             "max_hops": max_hops,
             "project_id": project_id,
         }
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/memories/ask", json_data=data)
 
     async def reason_memories(

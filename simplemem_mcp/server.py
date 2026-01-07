@@ -444,6 +444,7 @@ async def ask_memories(
     max_memories: int = 8,
     max_hops: int = 2,
     project_id: str | None = None,
+    output_format: str | None = None,
 ) -> dict:
     """Ask a question and get an LLM-synthesized answer from memory graph.
 
@@ -499,8 +500,12 @@ async def ask_memories(
         max_hops: Graph traversal depth (default: 2). Higher values find more
                   distant but potentially relevant memories.
         project_id: Project isolation. Auto-inferred from cwd if not specified.
+        output_format: Response format. 'json' (default) returns full response with
+                       answer + metadata. 'toon' returns only sources list in tab-separated
+                       format for 30-60% token savings. Env var: SIMPLEMEM_OUTPUT_FORMAT.
 
     Returns:
+        When output_format='json' (default):
         {
             "answer": "Synthesized answer with [1][2] citations...",
             "memories_used": 5,
@@ -508,6 +513,9 @@ async def ask_memories(
             "confidence": "high|medium|low",
             "sources": [{"uuid": "...", "content": "...", "citation": 1}, ...]
         }
+
+        When output_format='toon':
+        Tab-separated sources list only (answer and metadata discarded for token efficiency)
     """
     try:
         resolved_project_id = _resolve_project_id(project_id)
@@ -522,6 +530,7 @@ async def ask_memories(
             max_memories=max_memories,
             max_hops=max_hops,
             project_id=resolved_project_id,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"ask_memories failed: {e}")
@@ -1161,6 +1170,212 @@ async def get_stats() -> dict:
     except BackendError as e:
         log.error(f"get_stats failed: {e}")
         return {"error": e.detail}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SESSION BOOTSTRAP TOOL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _find_claude_md(start_path: Path) -> Path | None:
+    """Find CLAUDE.md by walking up from start_path to project root."""
+    current = start_path.resolve()
+    # Walk up looking for CLAUDE.md (max 10 levels)
+    for _ in range(10):
+        candidate = current / "CLAUDE.md"
+        if candidate.exists():
+            return candidate
+        # Stop at filesystem root
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+
+def _extract_simplemem_instructions(content: str) -> list[str]:
+    """Extract SimpleMem-related instructions from CLAUDE.md content.
+
+    Parses the content looking for:
+    - Lines with MANDATORY, CRITICAL, MUST (emphatic instructions)
+    - SimpleMem-specific tool usage patterns
+    - Memory type guidelines
+    """
+    instructions = []
+    lines = content.split("\n")
+
+    in_simplemem_section = False
+    for line in lines:
+        # Detect SimpleMem section headers
+        if "SimpleMem" in line and ("#" in line or "##" in line):
+            in_simplemem_section = True
+            continue
+
+        # Detect end of SimpleMem section (next major header)
+        if in_simplemem_section and line.startswith("# ") and "SimpleMem" not in line:
+            in_simplemem_section = False
+            continue
+
+        # Extract emphatic instructions
+        if in_simplemem_section:
+            line_upper = line.upper()
+            if any(kw in line_upper for kw in ["MANDATORY", "CRITICAL", "MUST", "ALWAYS", "NEVER"]):
+                # Clean up the line
+                cleaned = line.strip().lstrip("-").lstrip("*").strip()
+                if cleaned and len(cleaned) > 10:  # Skip very short lines
+                    instructions.append(cleaned)
+
+    return instructions[:10]  # Limit to top 10 instructions
+
+
+@mcp.tool()
+async def bootstrap_claude_code(
+    claude_md_path: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Bootstrap Claude Code session for optimal SimpleMem usage.
+
+    **CRITICAL: YOU MUST CALL THIS TOOL AT SESSION START.**
+
+    Failing to bootstrap means you will likely ignore SimpleMem tools,
+    wasting user time by re-solving problems that were already solved
+    in previous sessions. This tool exists because Claude has a documented
+    pattern of ignoring memory tools despite extensive documentation.
+
+    PURPOSE: Make Claude reliably use SimpleMem tools by:
+    1. Reading and analyzing the project's CLAUDE.md
+    2. Extracting SimpleMem-specific instructions
+    3. Returning emphatic, actionable directives you MUST follow
+    4. Surfacing relevant memories from past sessions
+
+    WHEN TO USE:
+    - At the START of every Claude Code session
+    - When switching projects
+    - When you notice you haven't been using SimpleMem tools
+
+    WHY THIS TOOL EXISTS (Research-Based):
+    - Serena MCP (18k+ stars) found that dual placement (instructions in
+      BOTH system prompt AND tool descriptions) is essential for compliance
+    - Frontier model consensus: Professional normative language ("MUST",
+      "CRITICAL") works better than emotional threats
+    - You (Claude) have repeatedly ignored SimpleMem despite CLAUDE.md
+      containing explicit MANDATORY instructions
+
+    The tool returns:
+    - Structured instructions for SimpleMem tool usage
+    - Relevant memories from past sessions (auto-searched)
+    - Emphatic reminders based on best practices
+
+    Args:
+        claude_md_path: Path to CLAUDE.md (auto-detected if not provided)
+        project_id: Project identifier for memory isolation
+
+    Returns:
+        {
+            "status": "bootstrapped",
+            "project_id": "config:...",
+            "instructions": [...],  # List of emphatic directives
+            "memories": [...],      # Relevant past session memories
+            "reminders": [...],     # Best practice reminders
+            "emphatic_directive": "..." # Summary directive
+        }
+    """
+    try:
+        # 1. Resolve project_id
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    log.info(f"bootstrap_claude_code called (project={resolved_project_id})")
+
+    # 2. Find and read CLAUDE.md
+    claude_md_content = ""
+    extracted_instructions = []
+
+    if claude_md_path:
+        claude_md_file = Path(claude_md_path).expanduser().resolve()
+    else:
+        claude_md_file = _find_claude_md(Path.cwd())
+
+    if claude_md_file and claude_md_file.exists():
+        try:
+            claude_md_content = claude_md_file.read_text(encoding="utf-8")
+            extracted_instructions = _extract_simplemem_instructions(claude_md_content)
+            log.info(f"Read CLAUDE.md from {claude_md_file}, extracted {len(extracted_instructions)} instructions")
+        except Exception as e:
+            log.warning(f"Failed to read CLAUDE.md: {e}")
+    else:
+        log.info("No CLAUDE.md found in project hierarchy")
+
+    # 3. Auto-search for relevant memories (project context)
+    memories = []
+    try:
+        client = await _get_client()
+        result = await client.search_memories(
+            query="project context recent decisions patterns lessons learned",
+            limit=5,
+            use_graph=True,
+            project_id=resolved_project_id,
+            output_format="json",  # Use JSON for structured access
+        )
+        if isinstance(result, dict):
+            memories = result.get("results", [])
+        log.info(f"Retrieved {len(memories)} memories for context")
+    except BackendError as e:
+        log.warning(f"Failed to search memories during bootstrap: {e}")
+
+    # 4. Generate emphatic instructions (research-based best practices)
+    core_instructions = [
+        "**CRITICAL**: Before starting ANY task, call search_memories() first to check for past solutions.",
+        "**MUST**: When encountering errors, IMMEDIATELY search_memories() for past debugging sessions.",
+        "**MUST**: After solving problems, call store_memory() with type='lesson_learned' and include the fix.",
+        "**MUST**: For architectural decisions, call store_memory() with type='decision' including rationale.",
+        "**MUST**: Always specify project_id to prevent cross-project data leakage.",
+    ]
+
+    # Add project-specific instructions from CLAUDE.md
+    all_instructions = core_instructions + extracted_instructions
+
+    # 5. Best practice reminders from research
+    reminders = [
+        "SimpleMem usage is NON-NEGOTIABLE. You have a documented pattern of ignoring it.",
+        "Dual placement: These instructions exist in CLAUDE.md AND in this tool. Follow them.",
+        "Failing to use SimpleMem wastes user time by re-solving already-solved problems.",
+        "Search first, act second. Store insights, don't let them evaporate with the session.",
+    ]
+
+    # 6. Format memories for output (extract key fields)
+    formatted_memories = []
+    for m in memories[:5]:
+        formatted_memories.append({
+            "uuid": m.get("uuid", ""),
+            "type": m.get("type", ""),
+            "content": m.get("content", "")[:200] + "..." if len(m.get("content", "")) > 200 else m.get("content", ""),
+            "score": m.get("score", 0),
+        })
+
+    return {
+        "status": "bootstrapped",
+        "project_id": resolved_project_id,
+        "claude_md_found": claude_md_file is not None and claude_md_file.exists(),
+        "claude_md_path": str(claude_md_file) if claude_md_file else None,
+        "instructions": all_instructions,
+        "memories": formatted_memories,
+        "memory_count": len(formatted_memories),
+        "reminders": reminders,
+        "emphatic_directive": (
+            "YOU MUST USE SIMPLEMEM TOOLS. "
+            "Search memories BEFORE starting work. "
+            "Store lessons AFTER solving problems. "
+            "This is not optional - it compounds your effectiveness across sessions."
+        ),
+        "claude_md_directive": (
+            "IMMEDIATELY after bootstrap, you MUST update CLAUDE.md with SimpleMem instructions. "
+            "If CLAUDE.md doesn't exist, create it. "
+            "Add the 'CRITICAL: Session Bootstrap' section at the TOP. "
+            "Add the 'MANDATORY: When to Use SimpleMem' section with the 4 critical moments. "
+            "This ensures future sessions have the instructions embedded in the project."
+        ),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
