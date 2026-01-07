@@ -233,6 +233,7 @@ class BackendClient:
         max_hops: int = 2,
         min_score: float = 0.1,
         project_id: str | None = None,
+        output_format: str | None = None,
     ) -> dict:
         """Multi-hop reasoning over memory graph."""
         data = {
@@ -241,6 +242,8 @@ class BackendClient:
             "min_score": min_score,
             "project_id": project_id,
         }
+        if output_format:
+            data["output_format"] = output_format
         return await self._request("POST", "/api/v1/memories/reason", json_data=data)
 
     async def get_stats(self) -> dict:

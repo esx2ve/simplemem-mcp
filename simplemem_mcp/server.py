@@ -543,6 +543,7 @@ async def reason_memories(
     max_hops: int = 2,
     min_score: float = 0.1,
     project_id: str | None = None,
+    output_format: str | None = None,
 ) -> dict:
     """Multi-hop reasoning over memory graph for complex questions.
 
@@ -595,8 +596,11 @@ async def reason_memories(
         min_score: Minimum relevance score threshold (0.0-1.0). Lower values
                    include more distant but potentially relevant memories.
         project_id: Project isolation. Auto-inferred from cwd if not specified.
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
 
     Returns:
+        When output_format='json':
         {
             "conclusions": [
                 {
@@ -610,6 +614,9 @@ async def reason_memories(
                 ...
             ]
         }
+
+        When output_format='toon' (default):
+        Tab-separated conclusions list only (30-60% token savings)
     """
     try:
         resolved_project_id = _resolve_project_id(project_id)
@@ -624,6 +631,7 @@ async def reason_memories(
             max_hops=max_hops,
             min_score=min_score,
             project_id=resolved_project_id,
+            output_format=output_format,
         )
     except BackendError as e:
         log.error(f"reason_memories failed: {e}")
