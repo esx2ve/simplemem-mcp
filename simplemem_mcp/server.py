@@ -119,44 +119,42 @@ def _resolve_project_id(
     path: str | None = None,
     require_bootstrap: bool = True,
 ) -> str | None:
-    """Resolve project_id from .simplemem.yaml config (STRICT MODE).
+    """Resolve project_id from explicit param or .simplemem.yaml config.
 
-    IMPORTANT: This function enforces mandatory bootstrap. If no config
-    is found, NotBootstrappedError is raised with helpful suggestions.
+    IMPORTANT: Explicit project_id takes precedence over config file.
+    The config is only used as a fallback when no explicit project_id is provided.
 
     Args:
-        project_id: Optional explicit project_id. If provided with "config:"
-                    prefix, validated against actual config.
+        project_id: Optional explicit project_id. If provided, this is used
+                    directly (with "config:" prefix normalization).
         path: Optional path to resolve from. Defaults to cwd.
         require_bootstrap: If True (default), raise NotBootstrappedError
-                          if no config found. If False, return None.
+                          if no config found and no explicit project_id.
+                          If False, return None.
 
     Returns:
-        Project ID with "config:" prefix from .simplemem.yaml
+        Project ID with "config:" prefix (from explicit param or config)
 
     Raises:
-        NotBootstrappedError: If require_bootstrap=True and no config found
+        NotBootstrappedError: If require_bootstrap=True, no explicit project_id,
+                             and no config found
     """
+    # If explicit project_id provided, use it directly (with normalization)
+    if project_id:
+        # Normalize: add config: prefix if missing
+        if not project_id.startswith("config:"):
+            project_id = f"config:{project_id}"
+        log.debug(f"Using explicit project_id: {project_id}")
+        return project_id
+
+    # No explicit project_id - try to load from config file
     resolved_path = Path(path).resolve() if path else Path.cwd().resolve()
 
     try:
         # find_project_root raises NotBootstrappedError if no config
         config_dir, config = find_project_root(resolved_path)
         actual_project_id = config.project_id
-
-        # If explicit project_id provided, validate it matches config
-        if project_id:
-            # Normalize: add config: prefix if missing
-            if not project_id.startswith("config:"):
-                project_id = f"config:{project_id}"
-
-            if project_id != actual_project_id:
-                log.warning(
-                    f"Explicit project_id '{project_id}' doesn't match config "
-                    f"'{actual_project_id}'. Using config value."
-                )
-
-        log.debug(f"Resolved project_id: {actual_project_id} from {config_dir}")
+        log.debug(f"Resolved project_id from config: {actual_project_id} ({config_dir})")
         return actual_project_id
 
     except NotBootstrappedError:
