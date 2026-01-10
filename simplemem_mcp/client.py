@@ -186,6 +186,7 @@ class BackendClient:
         type_filter: str | None = None,
         project_id: str | None = None,
         output_format: str | None = None,
+        use_graph_scoring: bool = True,
     ) -> dict | str:
         """Search memories via backend API.
 
@@ -199,6 +200,7 @@ class BackendClient:
             data["project_id"] = project_id
         if output_format:
             data["output_format"] = output_format
+        data["use_graph_scoring"] = use_graph_scoring
         return await self._request("POST", "/api/v1/memories/search", json_data=data)
 
     async def relate_memories(
@@ -619,3 +621,133 @@ class BackendClient:
             return result.get("status") == "healthy"
         except Exception:
             return False
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # SCRATCHPAD API
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def save_scratchpad(
+        self,
+        task_id: str,
+        scratchpad: dict,
+        project_id: str,
+    ) -> dict:
+        """Save or replace a scratchpad for a task.
+
+        Args:
+            task_id: Unique task identifier
+            scratchpad: Scratchpad data (JSON+TOON hybrid format)
+            project_id: Project identifier for isolation
+
+        Returns:
+            {success: True, uuid: "...", created: True/False}
+        """
+        data = {
+            "task_id": task_id,
+            "scratchpad": scratchpad,
+            "project_id": project_id,
+        }
+        return await self._request("POST", f"/api/v1/scratchpad/{task_id}", json_data=data)
+
+    async def load_scratchpad(
+        self,
+        task_id: str,
+        project_id: str,
+        expand_memories: bool = False,
+    ) -> dict:
+        """Load a scratchpad for a task.
+
+        Args:
+            task_id: Unique task identifier
+            project_id: Project identifier for isolation
+            expand_memories: If True, fetch full content of attached memories
+
+        Returns:
+            {scratchpad: {...}, uuid: "...", updated_at: ..., expanded_memories: [...]}
+        """
+        params = {"project_id": project_id, "expand_memories": expand_memories}
+        return await self._request("GET", f"/api/v1/scratchpad/{task_id}", params=params)
+
+    async def update_scratchpad(
+        self,
+        task_id: str,
+        patch: dict,
+        project_id: str,
+    ) -> dict:
+        """Partially update a scratchpad.
+
+        Args:
+            task_id: Unique task identifier
+            patch: Fields to update (partial)
+            project_id: Project identifier for isolation
+
+        Returns:
+            {success: True, updated_fields: [...]}
+        """
+        data = {"patch": patch, "project_id": project_id}
+        return await self._request("PATCH", f"/api/v1/scratchpad/{task_id}", json_data=data)
+
+    async def attach_to_scratchpad(
+        self,
+        task_id: str,
+        project_id: str,
+        memory_ids: list[str] | None = None,
+        session_ids: list[str] | None = None,
+        reasons: dict[str, str] | None = None,
+    ) -> dict:
+        """Attach memory and/or session references to a scratchpad.
+
+        Args:
+            task_id: Unique task identifier
+            project_id: Project identifier for isolation
+            memory_ids: Memory UUIDs to attach
+            session_ids: Session IDs to attach
+            reasons: Optional reasons per ID
+
+        Returns:
+            {success: True, attached: {memories: N, sessions: N}}
+        """
+        data: dict[str, Any] = {"project_id": project_id}
+        if memory_ids:
+            data["memory_ids"] = memory_ids
+        if session_ids:
+            data["session_ids"] = session_ids
+        if reasons:
+            data["reasons"] = reasons
+        return await self._request("POST", f"/api/v1/scratchpad/{task_id}/attach", json_data=data)
+
+    async def render_scratchpad(
+        self,
+        task_id: str,
+        project_id: str,
+        format: str = "markdown",
+    ) -> dict:
+        """Render a scratchpad in human-readable format.
+
+        Args:
+            task_id: Unique task identifier
+            project_id: Project identifier for isolation
+            format: Output format - "markdown" or "json" (expanded)
+
+        Returns:
+            {rendered: "...", format: "..."}
+        """
+        params = {"project_id": project_id, "format": format}
+        return await self._request("GET", f"/api/v1/scratchpad/{task_id}/render", params=params)
+
+    async def delete_scratchpad(
+        self,
+        task_id: str,
+        project_id: str,
+    ) -> dict:
+        """Delete a scratchpad.
+
+        Args:
+            task_id: Unique task identifier
+            project_id: Project identifier for isolation
+
+        Returns:
+            {success: True, deleted: True/False}
+        """
+        params = {"project_id": project_id}
+        return await self._request("DELETE", f"/api/v1/scratchpad/{task_id}", params=params)

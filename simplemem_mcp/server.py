@@ -270,6 +270,7 @@ async def search_memories(
     type_filter: str | None = None,
     project_id: str | None = None,
     output_format: str | None = None,
+    use_graph_scoring: bool = True,
 ) -> dict | str:
     """Hybrid search combining vector similarity and graph traversal.
 
@@ -333,6 +334,10 @@ async def search_memories(
                     CRITICAL: Always use to prevent retrieving unrelated memories.
         output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
                        "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
+        use_graph_scoring: Enable graph-enhanced scoring (default: True). When True,
+                           incorporates PageRank and connectivity (node degree) into
+                           ranking. Recommended for rapidly changing codebases where
+                           supersession and graph relationships matter.
 
     Returns:
         TOON format (default): Tab-separated string for 30-60% token reduction
@@ -354,6 +359,7 @@ async def search_memories(
             type_filter=type_filter,
             project_id=resolved_project_id,
             output_format=output_format,
+            use_graph_scoring=use_graph_scoring,
         )
         # TOON format returns raw string, JSON format returns dict
         if isinstance(result, str):
@@ -498,12 +504,12 @@ async def ask_memories(
         max_hops: Graph traversal depth (default: 2). Higher values find more
                   distant but potentially relevant memories.
         project_id: Project isolation. Auto-inferred from cwd if not specified.
-        output_format: Response format. 'json' (default) returns full response with
-                       answer + metadata. 'toon' returns only sources list in tab-separated
-                       format for 30-60% token savings. Env var: SIMPLEMEM_OUTPUT_FORMAT.
+        output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
+                       'toon' (default) = hybrid JSON with answer text + TOON sources.
+                       'json' = full structured dict.
 
     Returns:
-        When output_format='json' (default):
+        When output_format='json':
         {
             "answer": "Synthesized answer with [1][2] citations...",
             "memories_used": 5,
@@ -512,8 +518,15 @@ async def ask_memories(
             "sources": [{"uuid": "...", "content": "...", "citation": 1}, ...]
         }
 
-        When output_format='toon':
-        Tab-separated sources list only (answer and metadata discarded for token efficiency)
+        When output_format='toon' (default):
+        Hybrid JSON with answer text preserved + sources as TOON:
+        {
+            "answer": "Synthesized answer with [1][2] citations...",
+            "memories_used": 5,
+            "cross_session_insights": [...],
+            "confidence": "high|medium|low",
+            "sources": "uuid\\ttype\\tscore\\thops\\tcross_session\\n..."
+        }
     """
     try:
         resolved_project_id = _resolve_project_id(project_id)
@@ -595,26 +608,37 @@ async def reason_memories(
                    include more distant but potentially relevant memories.
         project_id: Project isolation. Auto-inferred from cwd if not specified.
         output_format: Response format. Default from SIMPLEMEM_OUTPUT_FORMAT env var.
-                       "toon" (default) = tab-separated for token efficiency, "json" = structured dict.
+                       "toon" (default) = hybrid JSON with reasoning text + TOON sources.
+                       "json" = full structured dict.
 
     Returns:
         When output_format='json':
         {
-            "conclusions": [
+            "reasoning": "LLM-synthesized explanation of evidence chains...",
+            "patterns": ["pattern 1", "pattern 2"],
+            "confidence": "high|medium|low",
+            "cross_session_count": 2,
+            "sources": [
                 {
                     "uuid": "...",
-                    "content": "...",
                     "type": "lesson_learned",
                     "score": 0.85,
                     "proof_chain": ["memory-1 → memory-2 → memory-3"],
-                    "hops": 2
+                    "hops": 2,
+                    "cross_session": false
                 },
                 ...
             ]
         }
 
         When output_format='toon' (default):
-        Tab-separated conclusions list only (30-60% token savings)
+        Hybrid JSON with reasoning text preserved + sources as TOON:
+        {
+            "reasoning": "LLM-synthesized explanation...",
+            "patterns": [...],
+            "confidence": "high|medium|low",
+            "sources": "uuid\\ttype\\tscore\\thops\\tcross_session\\n..."
+        }
     """
     try:
         resolved_project_id = _resolve_project_id(project_id)
@@ -2551,6 +2575,294 @@ async def check_code_staleness(
     except Exception as e:
         log.error(f"check_code_staleness failed: {e}")
         return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCRATCHPAD TOOLS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def save_scratchpad(
+    task_id: str,
+    scratchpad: dict,
+    project_id: str | None = None,
+) -> dict:
+    """Save or replace a scratchpad for a task.
+
+    PURPOSE: Persist task state in a JSON+TOON hybrid format for token-efficient
+    context engineering. Scratchpads maintain current focus, constraints, decisions,
+    and references to memories and sessions.
+
+    SCRATCHPAD SCHEMA (v1.1):
+    {
+        "task_id": str,                    # Unique identifier (required)
+        "version": "1.1",                  # Schema version
+        "current_focus": str,              # Plain text describing current work (required)
+        "active_constraints": str,         # TOON list: "constraint1\\tconstraint2\\t..."
+        "active_files": str,               # TOON list: "file1.py\\tfile2.ts\\t..."
+        "pending_verification": str,       # TOON list: "check1\\tcheck2\\t..."
+        "decisions": str,                  # TOON table: "what\\twhy\\trejected\\n..."
+        "notes": str,                      # Plain text notes
+        "attached_memories": str,          # TOON table: "uuid\\treason\\n..."
+        "attached_sessions": str,          # TOON table: "session_id\\tdescription\\n..."
+        "updated_at": int                  # Unix timestamp (auto-set)
+    }
+
+    TOON FORMAT:
+    - Lists: tab-separated values "item1\\titem2\\titem3"
+    - Tables: header row + data rows "col1\\tcol2\\nval1\\tval2\\nval3\\tval4"
+    - Achieves ~50% token savings vs JSON arrays/objects
+
+    WHEN TO USE:
+    - Starting a complex multi-step task
+    - Maintaining context across conversation turns
+    - Recording decisions and constraints
+    - Linking relevant memories for context
+
+    Args:
+        task_id: Unique task identifier (e.g., "feature-auth-2024-01")
+        scratchpad: Scratchpad data following the JSON+TOON hybrid schema
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+
+    Returns:
+        On success: {"success": True, "uuid": "...", "created": True/False}
+        On error: {"error": "..."}
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    assert resolved_project_id is not None  # Type narrowing for pyright
+
+    try:
+        log.info(f"save_scratchpad called (task_id={task_id}, project={resolved_project_id})")
+        client = await _get_client()
+        return await client.save_scratchpad(
+            task_id=task_id,
+            scratchpad=scratchpad,
+            project_id=resolved_project_id,
+        )
+    except BackendError as e:
+        log.error(f"save_scratchpad failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def load_scratchpad(
+    task_id: str,
+    project_id: str | None = None,
+    expand_memories: bool = False,
+) -> dict:
+    """Load a scratchpad for a task.
+
+    PURPOSE: Retrieve task state to restore context. Optionally expands
+    attached memory references to include their full content.
+
+    WHEN TO USE:
+    - Resuming work on a task
+    - Checking current constraints and decisions
+    - Getting context from attached memories
+
+    Args:
+        task_id: Unique task identifier
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+        expand_memories: If True, fetch full content of attached memories
+
+    Returns:
+        On success: {
+            "scratchpad": {...},           # Full scratchpad data
+            "uuid": "...",                 # Scratchpad UUID
+            "updated_at": 1234567890,      # Last update timestamp
+            "expanded_memories": [...]     # If expand_memories=True
+        }
+        On 404: {"error": "Scratchpad not found for task: ..."}
+        On error: {"error": "..."}
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    assert resolved_project_id is not None  # Type narrowing for pyright
+
+    try:
+        log.info(f"load_scratchpad called (task_id={task_id}, project={resolved_project_id})")
+        client = await _get_client()
+        return await client.load_scratchpad(
+            task_id=task_id,
+            project_id=resolved_project_id,
+            expand_memories=expand_memories,
+        )
+    except BackendError as e:
+        if e.status_code == 404:
+            return {"error": f"Scratchpad not found for task: {task_id}"}
+        log.error(f"load_scratchpad failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def update_scratchpad(
+    task_id: str,
+    patch: dict,
+    project_id: str | None = None,
+) -> dict:
+    """Partially update a scratchpad.
+
+    PURPOSE: Update specific fields without replacing the entire scratchpad.
+    Useful for incremental updates like adding a decision or changing focus.
+
+    PROTECTED FIELDS (cannot be changed via patch):
+    - task_id: Immutable identifier
+    - version: Schema version
+    - uuid: Internal identifier
+
+    WHEN TO USE:
+    - Updating current_focus as work progresses
+    - Adding a new decision
+    - Updating constraints or pending verification items
+    - Adding notes
+
+    Args:
+        task_id: Unique task identifier
+        patch: Fields to update (partial dict)
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+
+    Returns:
+        On success: {"success": True, "updated_fields": ["field1", "field2"]}
+        On 404: {"error": "Scratchpad not found for task: ..."}
+        On validation error: {"error": "Invalid scratchpad after patch: ..."}
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    assert resolved_project_id is not None  # Type narrowing for pyright
+
+    try:
+        log.info(f"update_scratchpad called (task_id={task_id}, project={resolved_project_id})")
+        client = await _get_client()
+        return await client.update_scratchpad(
+            task_id=task_id,
+            patch=patch,
+            project_id=resolved_project_id,
+        )
+    except BackendError as e:
+        if e.status_code == 404:
+            return {"error": f"Scratchpad not found for task: {task_id}"}
+        log.error(f"update_scratchpad failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def attach_to_scratchpad(
+    task_id: str,
+    project_id: str | None = None,
+    memory_ids: list[str] | None = None,
+    session_ids: list[str] | None = None,
+    reasons: dict[str, str] | None = None,
+) -> dict:
+    """Attach memory and/or session references to a scratchpad.
+
+    PURPOSE: Link relevant memories and sessions to provide context for the task.
+    Creates graph edges for traversal and updates the scratchpad's TOON tables.
+
+    GRAPH RELATIONSHIPS CREATED:
+    - Memory attachments: (Scratchpad)-[:REFERENCES {reason: "..."}]->(Memory)
+    - Session attachments: (Scratchpad)-[:FROM_SESSION]->(Session)
+
+    WHEN TO USE:
+    - After search_memories finds relevant context
+    - Linking debugging insights to current task
+    - Connecting architectural decisions for reference
+    - Recording which sessions informed current work
+
+    Args:
+        task_id: Unique task identifier
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+        memory_ids: List of memory UUIDs to attach
+        session_ids: List of session IDs to attach
+        reasons: Optional dict mapping IDs to reasons (e.g., {"uuid": "source of fix"})
+
+    Returns:
+        On success: {"success": True, "attached": {"memories": N, "sessions": N}}
+        On 404: {"error": "Scratchpad not found for task: ..."}
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    assert resolved_project_id is not None  # Type narrowing for pyright
+
+    try:
+        log.info(f"attach_to_scratchpad called (task_id={task_id}, project={resolved_project_id})")
+        client = await _get_client()
+        return await client.attach_to_scratchpad(
+            task_id=task_id,
+            project_id=resolved_project_id,
+            memory_ids=memory_ids,
+            session_ids=session_ids,
+            reasons=reasons,
+        )
+    except BackendError as e:
+        if e.status_code == 404:
+            return {"error": f"Scratchpad not found for task: {task_id}"}
+        log.error(f"attach_to_scratchpad failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def render_scratchpad(
+    task_id: str,
+    project_id: str | None = None,
+    format: str = "markdown",
+) -> dict:
+    """Render a scratchpad in human-readable format.
+
+    PURPOSE: Generate a readable view of the scratchpad for display or export.
+    Expands TOON tables into markdown tables or full JSON structures.
+
+    OUTPUT FORMATS:
+    - "markdown": Human-readable markdown with headers and tables
+    - "json": Fully expanded JSON (TOON strings → native lists/dicts)
+
+    WHEN TO USE:
+    - Displaying task context to the user
+    - Exporting task state for documentation
+    - Debugging scratchpad contents
+
+    Args:
+        task_id: Unique task identifier
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
+        format: Output format - "markdown" or "json"
+
+    Returns:
+        On success: {"rendered": "...", "format": "markdown|json"}
+        On 404: {"error": "Scratchpad not found for task: ..."}
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project_id)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    assert resolved_project_id is not None  # Type narrowing for pyright
+
+    try:
+        log.info(f"render_scratchpad called (task_id={task_id}, format={format}, project={resolved_project_id})")
+        client = await _get_client()
+        return await client.render_scratchpad(
+            task_id=task_id,
+            project_id=resolved_project_id,
+            format=format,
+        )
+    except BackendError as e:
+        if e.status_code == 404:
+            return {"error": f"Scratchpad not found for task: {task_id}"}
+        log.error(f"render_scratchpad failed: {e}")
+        return {"error": e.detail}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
