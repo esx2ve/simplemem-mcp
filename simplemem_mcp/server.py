@@ -2634,7 +2634,8 @@ async def save_scratchpad(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    assert resolved_project_id is not None  # Type narrowing for pyright
+    if resolved_project_id is None:
+        return {"error": "Project ID is required"}
 
     try:
         log.info(f"save_scratchpad called (task_id={task_id}, project={resolved_project_id})")
@@ -2685,7 +2686,8 @@ async def load_scratchpad(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    assert resolved_project_id is not None  # Type narrowing for pyright
+    if resolved_project_id is None:
+        return {"error": "Project ID is required"}
 
     try:
         log.info(f"load_scratchpad called (task_id={task_id}, project={resolved_project_id})")
@@ -2739,7 +2741,8 @@ async def update_scratchpad(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    assert resolved_project_id is not None  # Type narrowing for pyright
+    if resolved_project_id is None:
+        return {"error": "Project ID is required"}
 
     try:
         log.info(f"update_scratchpad called (task_id={task_id}, project={resolved_project_id})")
@@ -2795,7 +2798,8 @@ async def attach_to_scratchpad(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    assert resolved_project_id is not None  # Type narrowing for pyright
+    if resolved_project_id is None:
+        return {"error": "Project ID is required"}
 
     try:
         log.info(f"attach_to_scratchpad called (task_id={task_id}, project={resolved_project_id})")
@@ -2848,7 +2852,8 @@ async def render_scratchpad(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    assert resolved_project_id is not None  # Type narrowing for pyright
+    if resolved_project_id is None:
+        return {"error": "Project ID is required"}
 
     try:
         log.info(f"render_scratchpad called (task_id={task_id}, format={format}, project={resolved_project_id})")
