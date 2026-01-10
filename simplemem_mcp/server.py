@@ -2866,6 +2866,218 @@ async def render_scratchpad(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# V2 UNIFIED API - 3 TOOLS TO RULE THEM ALL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def remember(
+    content: str,
+    project: str | None = None,
+    type: str = "fact",
+    relations: list[str] | None = None,
+) -> dict:
+    """Store a memory with optional relations.
+
+    PURPOSE: Unified entry point for storing memories. Simpler API than store_memory.
+
+    MEMORY TYPES:
+    - "fact": Project-specific facts, configurations, conventions (default)
+    - "lesson_learned": Debugging insights, gotchas, what worked/didn't work
+    - "decision": Architectural choices with rationale and rejected alternatives
+    - "pattern": Reusable code patterns, approaches, templates
+
+    EXAMPLES:
+        # Store a lesson learned
+        remember(content="Fix: Check Docker when DB fails", type="lesson_learned", project="myproject")
+
+        # Store a decision with relations
+        remember(
+            content="Decision: Use Redis for caching | Reason: Speed",
+            type="decision",
+            relations=["uuid-of-related-memory"],
+            project="myproject"
+        )
+
+    Args:
+        content: The content to store. Be specific and actionable.
+        project: Project ID for isolation (recommended). Auto-inferred from cwd if not specified.
+        type: Memory type: fact (default), lesson_learned, decision, pattern
+        relations: Optional list of memory UUIDs to relate this memory to
+
+    Returns:
+        On success: {"uuid": "<memory-uuid>", "relations_created": N}
+        On error: {"error": "<error-message>"}
+    """
+    try:
+        resolved_project_id = _resolve_project_id(project)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    log.info(f"remember called (type={type}, project={resolved_project_id})")
+    try:
+        client = await _get_client()
+        result = await client.remember(
+            content=content,
+            project=resolved_project_id,
+            type=type,
+            relations=relations,
+        )
+        return result
+    except BackendError as e:
+        log.error(f"remember failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def recall(
+    query: str | None = None,
+    id: str | None = None,
+    project: str | None = None,
+    mode: str = "fast",
+    limit: int = 10,
+    output_format: str | None = None,
+) -> dict | str:
+    """Find memories by query or exact ID.
+
+    PURPOSE: Unified entry point for all memory retrieval. Replaces search_memories,
+    search_memories_deep, ask_memories, and get-by-ID operations.
+
+    MODES:
+    - "fast": Vector similarity search (default, quickest)
+    - "deep": LLM-reranked results with conflict detection
+    - "ask": LLM-synthesized answer with citations
+
+    EXAMPLES:
+        # Quick search
+        recall(query="database timeout fix", project="myproject")
+
+        # Get specific memory by ID
+        recall(id="abc-123-uuid")
+
+        # Deep search with reranking
+        recall(query="authentication patterns", mode="deep")
+
+        # Get synthesized answer
+        recall(query="How did we fix the memory leak?", mode="ask")
+
+    Args:
+        query: Search query (required if no id)
+        id: Exact memory UUID to fetch (bypasses search)
+        project: Project ID for isolation. Auto-inferred from cwd if not specified.
+        mode: Search mode - fast (default), deep (reranked), ask (LLM synthesis)
+        limit: Maximum results (default: 10)
+        output_format: Response format - "toon" (default) or "json"
+
+    Returns:
+        For fast/deep modes: {"results": [...], "conflicts": [...]}
+        For ask mode: {"answer": "...", "sources": [...], "confidence": "..."}
+        On error: {"error": "<error-message>"}
+    """
+    # Validate: need either query or id
+    if not query and not id:
+        return {"error": "Either 'query' or 'id' is required"}
+
+    try:
+        resolved_project_id = _resolve_project_id(project)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    log.info(f"recall called (mode={mode}, project={resolved_project_id})")
+    try:
+        client = await _get_client()
+        result = await client.recall(
+            query=query,
+            id=id,
+            project=resolved_project_id,
+            mode=mode,
+            limit=limit,
+            output_format=output_format or OUTPUT_FORMAT,
+        )
+        return result
+    except BackendError as e:
+        log.error(f"recall failed: {e}")
+        return {"error": e.detail}
+
+
+@mcp.tool()
+async def index_v2(
+    project: str,
+    files: list[dict] | None = None,
+    traces: list[dict] | None = None,
+    clear_existing: bool = True,
+    wait: bool = False,
+) -> dict:
+    """Index code files or session traces for semantic search.
+
+    PURPOSE: Unified entry point for all indexing. Provide either 'files' for code
+    indexing or 'traces' for trace processing.
+
+    FILE FORMAT:
+        files=[{"path": "src/app.py", "content": "..."}]
+
+    TRACE FORMAT:
+        traces=[{"session_id": "abc-123", "content": {...}}]
+
+    EXAMPLES:
+        # Index code files (synchronous)
+        index_v2(
+            project="myproject",
+            files=[{"path": "src/app.py", "content": "..."}],
+            wait=True
+        )
+
+        # Index session traces (background)
+        index_v2(
+            project="myproject",
+            traces=[{"session_id": "abc-123", "content": {...}}]
+        )
+
+    Args:
+        project: Project ID for isolation (required)
+        files: Files to index (each with "path" and "content" keys)
+        traces: Traces to index (each with "session_id" and "content" keys)
+        clear_existing: Clear existing code index before indexing (default: True)
+        wait: Wait for completion (default: False, runs in background)
+
+    Returns:
+        If wait=False: {"job_id": "...", "status": "submitted", "message": "..."}
+        If wait=True: {"status": "completed", "files_indexed": N, "chunks_created": N}
+        On error: {"error": "<error-message>"}
+    """
+    # Validate: need either files or traces
+    if not files and not traces:
+        return {"error": "Either 'files' or 'traces' is required"}
+
+    if files and traces:
+        return {"error": "Cannot index both files and traces in same request"}
+
+    try:
+        resolved_project_id = _resolve_project_id(project)
+    except NotBootstrappedError as e:
+        return e.to_dict()
+
+    # Type narrowing: project is required, so resolved_project_id cannot be None
+    if resolved_project_id is None:
+        return {"error": "Project ID is required for indexing"}
+
+    log.info(f"index_v2 called (project={resolved_project_id}, files={len(files or [])}, traces={len(traces or [])})")
+    try:
+        client = await _get_client()
+        result = await client.index_v2(
+            project=resolved_project_id,
+            files=files,
+            traces=traces,
+            clear_existing=clear_existing,
+            wait=wait,
+        )
+        return result
+    except BackendError as e:
+        log.error(f"index_v2 failed: {e}")
+        return {"error": e.detail}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SERVER ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 

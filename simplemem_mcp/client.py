@@ -751,3 +751,126 @@ class BackendClient:
         """
         params = {"project_id": project_id}
         return await self._request("DELETE", f"/api/v1/scratchpad/{task_id}", params=params)
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # V2 UNIFIED API (3 tools: remember, recall, index)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def remember(
+        self,
+        content: str,
+        project: str | None = None,
+        type: str = "fact",
+        relations: list[str] | None = None,
+    ) -> dict:
+        """Store a memory with optional relations (V2 unified API).
+
+        Args:
+            content: The content to store
+            project: Project ID for isolation
+            type: Memory type (fact, lesson_learned, decision, pattern)
+            relations: List of memory UUIDs to relate this memory to
+
+        Returns:
+            {uuid: "...", relations_created: N}
+        """
+        data: dict[str, Any] = {"content": content, "type": type}
+        if project:
+            data["project"] = project
+        if relations:
+            data["relations"] = relations
+        return await self._request("POST", "/api/v1/v2/remember", json_data=data)
+
+    async def recall(
+        self,
+        query: str | None = None,
+        id: str | None = None,
+        project: str | None = None,
+        mode: str = "fast",
+        limit: int = 10,
+        output_format: str | None = None,
+    ) -> dict | str:
+        """Find memories by query or exact ID (V2 unified API).
+
+        Args:
+            query: Search query (required if no id)
+            id: Exact memory UUID to fetch
+            project: Project ID for isolation
+            mode: Search mode (fast, deep, ask)
+            limit: Max results
+            output_format: Response format ('toon' or 'json')
+
+        Returns:
+            For fast/deep: {results: [...]}
+            For ask: {answer: "...", memories_used: N, ...}
+        """
+        data: dict[str, Any] = {"mode": mode, "limit": limit}
+        if query:
+            data["query"] = query
+        if id:
+            data["id"] = id
+        if project:
+            data["project"] = project
+        if output_format:
+            data["output_format"] = output_format
+        return await self._request("POST", "/api/v1/v2/recall", json_data=data)
+
+    async def index_v2(
+        self,
+        project: str,
+        files: list[dict] | None = None,
+        traces: list[dict] | None = None,
+        clear_existing: bool = True,
+        wait: bool = False,
+    ) -> dict:
+        """Index code files or session traces (V2 unified API).
+
+        Args:
+            project: Project ID for isolation
+            files: Files to index [{path, content, compressed}]
+            traces: Traces to index [{session_id, content, compressed}]
+            clear_existing: Clear existing code index
+            wait: Wait for completion (default: background)
+
+        Returns:
+            If wait=False: {job_id: "...", status: "submitted", ...}
+            If wait=True: {status: "completed", files_indexed/traces_processed: N}
+        """
+        # Compress files if needed
+        compressed_files = None
+        if files:
+            compressed_files = []
+            for f in files:
+                content, was_compressed = compress_if_large(
+                    f.get("content", ""), threshold_bytes=COMPRESSION_THRESHOLD
+                )
+                compressed_files.append({
+                    "path": f["path"],
+                    "content": content,
+                    "compressed": was_compressed,
+                })
+
+        # Compress traces if needed
+        compressed_traces = None
+        if traces:
+            compressed_traces = []
+            for t in traces:
+                content, was_compressed = compress_if_large(
+                    t.get("content", {}), threshold_bytes=COMPRESSION_THRESHOLD
+                )
+                compressed_traces.append({
+                    "session_id": t["session_id"],
+                    "content": content,
+                    "compressed": was_compressed,
+                })
+
+        data: dict[str, Any] = {
+            "project": project,
+            "clear_existing": clear_existing,
+            "wait": wait,
+        }
+        if compressed_files:
+            data["files"] = compressed_files
+        if compressed_traces:
+            data["traces"] = compressed_traces
+        return await self._request("POST", "/api/v1/v2/index", json_data=data)
