@@ -6,6 +6,7 @@ preparing them for compression and transport to the backend API.
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -475,6 +476,37 @@ class LocalReader:
 
         return False, None
 
+    def _should_skip_dir(self, dir_name: str, rel_dir_path: Path, ignore_patterns: list[str] | None) -> tuple[bool, str | None]:
+        """Check if a directory should be skipped during traversal.
+
+        This is called BEFORE descending into a directory, enabling early pruning.
+
+        Args:
+            dir_name: Name of the directory (e.g., "node_modules")
+            rel_dir_path: Relative path to directory from scan root
+            ignore_patterns: User-provided gitignore-style patterns
+
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        # Check built-in exclusions (node_modules, .venv, etc.)
+        dir_with_slash = dir_name + "/"
+        if _BUILTIN_SPEC.match_file(dir_with_slash):
+            return True, f"built-in: {dir_name}"
+
+        # Check hidden directories (but allow .github, .storybook, etc.)
+        if dir_name.startswith(".") and dir_name not in {".github", ".storybook", ".circleci"}:
+            return True, f"hidden_dir: {dir_name}"
+
+        # Check user-provided ignore patterns against the full relative path
+        if ignore_patterns:
+            user_spec = self._get_ignore_spec(ignore_patterns)
+            rel_path_str = str(rel_dir_path / dir_name)
+            if user_spec and user_spec.match_file(rel_path_str + "/"):
+                return True, f"ignore_patterns: {dir_name}"
+
+        return False, None
+
     def _scan_files_internal(
         self,
         directory: Path,
@@ -485,6 +517,9 @@ class LocalReader:
         read_content: bool = True,
     ) -> Iterator[tuple[Path, Path, dict | None]]:
         """Internal generator for file scanning (shared by scan_code_files and dry_run_scan).
+
+        Uses os.walk() with directory pruning for O(matched_files) performance
+        instead of O(tree_size) from glob traversal.
 
         Args:
             directory: Directory to scan
@@ -500,26 +535,49 @@ class LocalReader:
             - exclusion_info is {"reason": str} if file should be excluded
         """
         patterns = patterns or self.code_patterns
-        directory = Path(directory)
+        directory = Path(directory).resolve()
 
         if not directory.exists():
             log.warning(f"Directory does not exist: {directory}")
             return
 
-        # Collect unique files from all patterns
-        found_paths: set[Path] = set()
-        for pattern in patterns:
-            for file_path in directory.glob(pattern):
-                if file_path.is_file():
-                    found_paths.add(file_path)
+        # Build pathspec for include patterns (converts glob to pathspec)
+        include_spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
         file_count = 0
         max_size_bytes = max_file_size_kb * 1024
 
-        for file_path in sorted(found_paths):
-            rel_path = file_path.relative_to(directory)
+        # Collect files to sort them (for deterministic output)
+        found_files: list[tuple[Path, Path]] = []
 
-            # Check exclusions
+        # Walk directory tree with pruning
+        for root, dirs, files in os.walk(directory):
+            root_path = Path(root)
+            rel_root = root_path.relative_to(directory)
+
+            # PRUNE: Remove excluded directories IN-PLACE (prevents descent)
+            # This is the key optimization - we never enter node_modules, .venv, etc.
+            original_dirs = dirs[:]
+            dirs[:] = []
+            for d in original_dirs:
+                should_skip, reason = self._should_skip_dir(d, rel_root, ignore_patterns)
+                if not should_skip:
+                    dirs.append(d)
+
+            # Check each file in current directory
+            for filename in files:
+                file_path = root_path / filename
+                rel_path = rel_root / filename
+
+                # Check if file matches include patterns
+                if not include_spec.match_file(str(rel_path)):
+                    continue
+
+                found_files.append((file_path, rel_path))
+
+        # Sort for deterministic output and process
+        for file_path, rel_path in sorted(found_files, key=lambda x: x[1]):
+            # Check file-level exclusions (patterns that match files, not just dirs)
             is_excluded, reason = self._is_excluded_path(rel_path, ignore_patterns)
             if is_excluded:
                 yield file_path, rel_path, {"reason": reason}
@@ -539,7 +597,7 @@ class LocalReader:
             # Check readability (read content if requested)
             if read_content:
                 try:
-                    content = file_path.read_text(encoding="utf-8")
+                    file_path.read_text(encoding="utf-8")
                     yield file_path, rel_path, None  # Success - caller will read content
                 except (UnicodeDecodeError, OSError) as e:
                     yield file_path, rel_path, {"reason": f"unreadable: {e}"}
