@@ -102,6 +102,8 @@ class SimpleMemConfig(BaseModel):
         project_name: "SimpleMem"  # optional display name
         folder_role: "source"  # optional: source, tests, docs
         exclude_patterns: []  # optional gitignore-style patterns
+        auto_watch: true  # optional: auto-start code watcher on bootstrap
+        watch_patterns: []  # optional: override default watch patterns
 
     Multiple folders can share the same project_id to merge their
     memories and code indexes into a single project.
@@ -112,6 +114,8 @@ class SimpleMemConfig(BaseModel):
     project_name: str | None = None  # Human-readable display name
     folder_role: str | None = None  # "source" | "tests" | "docs" | None
     exclude_patterns: list[str] = []
+    auto_watch: bool = True  # Auto-start code watcher on bootstrap
+    watch_patterns: list[str] = []  # Override patterns (empty = use defaults)
 
     @field_validator("project_id")
     @classmethod

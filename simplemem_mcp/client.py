@@ -370,6 +370,18 @@ class BackendClient:
         """Cancel a running background job."""
         return await self._request("POST", f"/api/v1/traces/job/{job_id}/cancel")
 
+    async def get_indexed_sessions(
+        self, project_id: str | None = None, limit: int = 100
+    ) -> dict:
+        """Get list of session IDs that have been successfully indexed.
+
+        Used to filter out already-processed sessions from discovery results.
+        """
+        params = {"limit": limit}
+        if project_id:
+            params["project_id"] = project_id
+        return await self._request("GET", "/api/v1/traces/indexed-sessions", params=params)
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # CODE API
     # ═══════════════════════════════════════════════════════════════════════════════
