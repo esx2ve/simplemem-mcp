@@ -800,6 +800,9 @@ class BackendClient:
         project: str | None = None,
         mode: str = "fast",
         limit: int = 10,
+        sort_by: str = "relevance",
+        since: str | None = None,
+        until: str | None = None,
         output_format: str | None = None,
     ) -> dict | str:
         """Find memories by query or exact ID (V2 unified API).
@@ -810,19 +813,26 @@ class BackendClient:
             project: Project ID for isolation
             mode: Search mode (fast, deep, ask)
             limit: Max results
+            sort_by: Sort order (relevance, newest, oldest)
+            since: Only return memories after this time (e.g., "2d", "1w", "2024-01-15")
+            until: Only return memories before this time (e.g., "2d", "1w", "2024-01-15")
             output_format: Response format ('toon' or 'json')
 
         Returns:
             For fast/deep: {results: [...]}
             For ask: {answer: "...", memories_used: N, ...}
         """
-        data: dict[str, Any] = {"mode": mode, "limit": limit}
+        data: dict[str, Any] = {"mode": mode, "limit": limit, "sort_by": sort_by}
         if query:
             data["query"] = query
         if id:
             data["id"] = id
         if project:
             data["project"] = project
+        if since:
+            data["since"] = since
+        if until:
+            data["until"] = until
         if output_format:
             data["output_format"] = output_format
         return await self._request("POST", "/api/v1/v2/recall", json_data=data)

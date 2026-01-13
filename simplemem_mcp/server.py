@@ -318,6 +318,9 @@ async def recall(
     project: str | None = None,
     mode: str = "fast",
     limit: int = 10,
+    sort_by: str = "relevance",
+    since: str | None = None,
+    until: str | None = None,
     output_format: str | None = None,
 ) -> dict | str:
     """Find memories by query or exact ID.
@@ -343,12 +346,24 @@ async def recall(
         # Get synthesized answer
         recall(query="How did we fix the memory leak?", mode="ask")
 
+        # Get memories from last 2 days only (prevent stale context)
+        recall(query="auth bug", project="myproject", since="2d")
+
+        # Get newest memories first (browse recent)
+        recall(query="", project="myproject", sort_by="newest", limit=20)
+
+        # Get memories from specific date range
+        recall(query="deployment", since="2024-01-01", until="2024-01-31")
+
     Args:
         query: Search query (required if no id)
         id: Exact memory UUID to fetch (bypasses search)
         project: Project ID for isolation. Auto-inferred from cwd if not specified.
         mode: Search mode - fast (default), deep (reranked), ask (LLM synthesis)
         limit: Maximum results (default: 10)
+        sort_by: Sort order - relevance (default), newest, oldest
+        since: Only return memories after this time. Supports relative ("2d", "1w", "30d") or ISO date ("2024-01-15")
+        until: Only return memories before this time. Supports relative ("2d", "1w") or ISO date ("2024-01-15")
         output_format: Response format - "toon" (default) or "json"
 
     Returns:
@@ -365,7 +380,7 @@ async def recall(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    log.info(f"recall called (mode={mode}, project={resolved_project_id})")
+    log.info(f"recall called (mode={mode}, project={resolved_project_id}, sort_by={sort_by}, since={since}, until={until})")
     try:
         client = await _get_client()
         result = await client.recall(
@@ -374,6 +389,9 @@ async def recall(
             project=resolved_project_id,
             mode=mode,
             limit=limit,
+            sort_by=sort_by,
+            since=since,
+            until=until,
             output_format=output_format or OUTPUT_FORMAT,
         )
         return result
