@@ -321,6 +321,8 @@ async def recall(
     sort_by: str = "relevance",
     since: str | None = None,
     until: str | None = None,
+    max_hops: int = 2,
+    min_score: float = 0.1,
     output_format: str | None = None,
 ) -> dict | str:
     """Find memories by query or exact ID.
@@ -332,6 +334,7 @@ async def recall(
     - "fast": Vector similarity search (default, quickest)
     - "deep": LLM-reranked results with conflict detection
     - "ask": LLM-synthesized answer with citations
+    - "reason": Multi-hop graph reasoning with LLM synthesis (follows relationships)
 
     EXAMPLES:
         # Quick search
@@ -346,6 +349,9 @@ async def recall(
         # Get synthesized answer
         recall(query="How did we fix the memory leak?", mode="ask")
 
+        # Multi-hop reasoning (follows graph relationships)
+        recall(query="What led to the database redesign?", mode="reason", max_hops=3)
+
         # Get memories from last 2 days only (prevent stale context)
         recall(query="auth bug", project="myproject", since="2d")
 
@@ -359,16 +365,19 @@ async def recall(
         query: Search query (required if no id)
         id: Exact memory UUID to fetch (bypasses search)
         project: Project ID for isolation. Auto-inferred from cwd if not specified.
-        mode: Search mode - fast (default), deep (reranked), ask (LLM synthesis)
+        mode: Search mode - fast (default), deep (reranked), ask (LLM synthesis), reason (multi-hop graph reasoning)
         limit: Maximum results (default: 10)
         sort_by: Sort order - relevance (default), newest, oldest
         since: Only return memories after this time. Supports relative ("2d", "1w", "30d") or ISO date ("2024-01-15")
         until: Only return memories before this time. Supports relative ("2d", "1w") or ISO date ("2024-01-15")
+        max_hops: For mode="reason": max graph hops to traverse (1-3, default: 2)
+        min_score: For mode="reason": minimum relevance score threshold (0.0-1.0, default: 0.1)
         output_format: Response format - "toon" (default) or "json"
 
     Returns:
         For fast/deep modes: {"results": [...], "conflicts": [...]}
         For ask mode: {"answer": "...", "sources": [...], "confidence": "..."}
+        For reason mode: {"reasoning": "...", "conclusions": [...], "sources": [...]}
         On error: {"error": "<error-message>"}
     """
     # Validate: need either query or id
@@ -383,6 +392,21 @@ async def recall(
     log.info(f"recall called (mode={mode}, project={resolved_project_id}, sort_by={sort_by}, since={since}, until={until})")
     try:
         client = await _get_client()
+
+        # Handle "reason" mode separately - uses different API endpoint
+        if mode == "reason":
+            if not query:
+                return {"error": "Query is required for mode='reason'"}
+            result = await client.reason_memories(
+                query=query,
+                max_hops=max_hops,
+                min_score=min_score,
+                project_id=resolved_project_id,
+                output_format=output_format or OUTPUT_FORMAT,
+            )
+            return result
+
+        # All other modes use the unified recall endpoint
         result = await client.recall(
             query=query,
             id=id,
