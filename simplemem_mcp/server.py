@@ -311,6 +311,62 @@ async def remember(
         return {"error": e.detail}
 
 
+def _detect_query_intent(query: str) -> str:
+    """Detect if query is code-oriented, memory-oriented, or both.
+
+    Used for auto-routing queries to the appropriate search backend:
+    - "code": Query should primarily search code index
+    - "memory": Query should primarily search memories
+    - "both": Query should search both and merge results
+
+    Args:
+        query: The search query string
+
+    Returns:
+        Intent classification: "code", "memory", or "both"
+    """
+    # Keywords strongly indicating code search intent
+    code_keywords = {
+        # Python-specific
+        "function", "class", "def", "import", "module", "async",
+        # General code terms
+        "implementation", "method", "api", "endpoint", "handler",
+        "controller", "service", "repository", "schema", "model",
+        # File extensions (with and without dots)
+        ".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs",
+        "py file", "ts file", "js file",
+        # Code actions
+        "where is", "find the", "locate", "source code",
+        "how is implemented", "how does the code",
+    }
+
+    # Keywords strongly indicating memory/knowledge search
+    memory_keywords = {
+        "decision", "why did we", "lesson learned", "what happened",
+        "remember", "previous", "last time", "history", "debug",
+        "fix", "error", "bug", "issue", "problem", "solved",
+        "architecture decision", "rationale", "reason for",
+    }
+
+    query_lower = query.lower()
+
+    # Count keyword matches
+    code_score = sum(1 for kw in code_keywords if kw in query_lower)
+    memory_score = sum(1 for kw in memory_keywords if kw in query_lower)
+
+    # Decision logic with thresholds
+    if code_score >= 2 and memory_score == 0:
+        return "code"
+    elif memory_score >= 2 and code_score == 0:
+        return "memory"
+    elif code_score >= 1 and memory_score >= 1:
+        return "both"
+    elif code_score >= 1:
+        return "both"  # Single code keyword = search both to be safe
+    else:
+        return "memory"  # Default to memory search
+
+
 @mcp.tool()
 async def recall(
     query: str | None = None,
@@ -324,6 +380,7 @@ async def recall(
     max_hops: int = 2,
     min_score: float = 0.1,
     output_format: str | None = None,
+    auto_route: bool = False,
 ) -> dict | str:
     """Find memories by query or exact ID.
 
@@ -335,6 +392,13 @@ async def recall(
     - "deep": LLM-reranked results with conflict detection
     - "ask": LLM-synthesized answer with citations
     - "reason": Multi-hop graph reasoning with LLM synthesis (follows relationships)
+
+    AUTO-ROUTING (auto_route=True):
+    When enabled, automatically detects query intent and routes to the appropriate
+    search backend:
+    - Code-oriented queries ("function", "implementation", "class") → code index
+    - Memory-oriented queries ("decision", "why", "lesson") → memory search
+    - Mixed queries → searches both and merges results
 
     EXAMPLES:
         # Quick search
@@ -358,8 +422,8 @@ async def recall(
         # Get newest memories first (browse recent)
         recall(query="", project="myproject", sort_by="newest", limit=20)
 
-        # Get memories from specific date range
-        recall(query="deployment", since="2024-01-01", until="2024-01-31")
+        # Auto-routing: finds both code implementations and debugging memories
+        recall(query="authentication handler implementation", auto_route=True)
 
     Args:
         query: Search query (required if no id)
@@ -373,11 +437,13 @@ async def recall(
         max_hops: For mode="reason": max graph hops to traverse (1-3, default: 2)
         min_score: For mode="reason": minimum relevance score threshold (0.0-1.0, default: 0.1)
         output_format: Response format - "toon" (default) or "json"
+        auto_route: Enable intelligent query routing to code/memory search (default: False)
 
     Returns:
         For fast/deep modes: {"results": [...], "conflicts": [...]}
         For ask mode: {"answer": "...", "sources": [...], "confidence": "..."}
         For reason mode: {"reasoning": "...", "conclusions": [...], "sources": [...]}
+        For auto_route with "both": {"memories": [...], "code": [...], "routing": "both"}
         On error: {"error": "<error-message>"}
     """
     # Validate: need either query or id
@@ -389,9 +455,76 @@ async def recall(
     except NotBootstrappedError as e:
         return e.to_dict()
 
-    log.info(f"recall called (mode={mode}, project={resolved_project_id}, sort_by={sort_by}, since={since}, until={until})")
+    log.info(f"recall called (mode={mode}, project={resolved_project_id}, sort_by={sort_by}, since={since}, until={until}, auto_route={auto_route})")
     try:
         client = await _get_client()
+
+        # Auto-routing: detect query intent and route to appropriate search
+        if auto_route and query and mode == "fast":
+            intent = _detect_query_intent(query)
+            log.info(f"Auto-routing detected intent: {intent} for query: '{query[:50]}...'")
+
+            if intent == "code":
+                # Route to code search only
+                code_result = await client.search_code(
+                    query=query,
+                    limit=limit,
+                    project_id=resolved_project_id,
+                    content_mode="preview",
+                    output_format="json",  # Need JSON for structured response
+                )
+                code_chunks = []
+                if isinstance(code_result, dict):
+                    code_chunks = code_result.get("results", [])
+                return {
+                    "code": code_chunks,
+                    "memories": [],
+                    "routing": "code",
+                    "intent_detected": intent,
+                }
+
+            elif intent == "both":
+                # Search both memory and code, merge results
+                import asyncio
+                memory_task = client.recall(
+                    query=query,
+                    id=None,
+                    project=resolved_project_id,
+                    mode="fast",
+                    limit=limit // 2 + 1,
+                    sort_by=sort_by,
+                    since=since,
+                    until=until,
+                    output_format="json",  # Need JSON for merging
+                )
+                code_task = client.search_code(
+                    query=query,
+                    limit=limit // 2 + 1,
+                    project_id=resolved_project_id,
+                    content_mode="preview",
+                    output_format="json",
+                )
+
+                memory_result, code_result = await asyncio.gather(
+                    memory_task, code_task, return_exceptions=True
+                )
+
+                # Handle potential errors
+                memories = []
+                code_chunks = []
+                if isinstance(memory_result, dict):
+                    memories = memory_result.get("results", [])
+                if isinstance(code_result, dict):
+                    code_chunks = code_result.get("results", [])
+
+                return {
+                    "memories": memories,
+                    "code": code_chunks,
+                    "routing": "both",
+                    "intent_detected": intent,
+                }
+
+            # intent == "memory" falls through to normal memory search
 
         # Handle "reason" mode separately - uses different API endpoint
         if mode == "reason":
