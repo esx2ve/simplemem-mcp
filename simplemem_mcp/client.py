@@ -454,10 +454,25 @@ class BackendClient:
         query: str,
         limit: int = 10,
         project_id: str | None = None,
+        content_mode: str = "preview",
         output_format: str | None = None,
     ) -> dict | str:
-        """Search code via backend API."""
-        data = {"query": query, "limit": limit}
+        """Search code via backend API.
+
+        Args:
+            query: Natural language search query
+            limit: Max results (default 10)
+            project_id: Filter to specific project
+            content_mode: Content verbosity level:
+                - 'signature': Function/class signature only (~15 tokens)
+                - 'preview': Signature + truncated body (~80 tokens)
+                - 'full': Complete content (~400 tokens)
+            output_format: Response format ('toon' or 'json')
+
+        Returns:
+            Search results dict or TOON string
+        """
+        data = {"query": query, "limit": limit, "content_mode": content_mode}
         if project_id:
             data["project_id"] = project_id
         if output_format:

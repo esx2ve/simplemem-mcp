@@ -532,6 +532,7 @@ async def search_code(
     project: str | None = None,
     mode: str = "search",
     limit: int = 10,
+    content_mode: str = "preview",
     chunk_uuid: str | None = None,
     memory_uuid: str | None = None,
     output_format: str | None = None,
@@ -550,6 +551,9 @@ async def search_code(
         # Search for code
         search_code(query="authentication handler", project="myproject")
 
+        # Token-efficient search (signature only)
+        search_code(query="authentication", project="myproject", content_mode="signature")
+
         # Find memories related to a code chunk
         search_code(mode="related_memories", chunk_uuid="abc-123")
 
@@ -564,6 +568,10 @@ async def search_code(
         project: Project ID for isolation. Auto-inferred from cwd if not specified.
         mode: Operation mode - search, related_memories, related_code, stats
         limit: Maximum results (default: 10)
+        content_mode: Content verbosity for mode="search". Default "preview".
+            - "signature": Function/class signature only (~15 tokens/result)
+            - "preview": Signature + truncated body (~80 tokens/result)
+            - "full": Complete content (~400 tokens/result)
         chunk_uuid: Code chunk UUID (required for mode="related_memories")
         memory_uuid: Memory UUID (required for mode="related_code")
         output_format: Response format - "toon" (default) or "json"
@@ -590,6 +598,7 @@ async def search_code(
                 query=query,
                 limit=limit,
                 project_id=resolved_project_id,
+                content_mode=content_mode,
                 output_format=output_format or OUTPUT_FORMAT,
             )
 
