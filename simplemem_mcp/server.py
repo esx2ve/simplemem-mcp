@@ -669,6 +669,8 @@ async def search_code(
     chunk_uuid: str | None = None,
     memory_uuid: str | None = None,
     output_format: str | None = None,
+    include_related_memories: bool = False,
+    related_memories_limit: int = 3,
 ) -> dict | str:
     """Semantic code search with related memories.
 
@@ -686,6 +688,9 @@ async def search_code(
 
         # Token-efficient search (signature only)
         search_code(query="authentication", project="myproject", content_mode="signature")
+
+        # Search with related debugging memories surfaced inline
+        search_code(query="error handling", project="myproject", include_related_memories=True)
 
         # Find memories related to a code chunk
         search_code(mode="related_memories", chunk_uuid="abc-123")
@@ -708,9 +713,11 @@ async def search_code(
         chunk_uuid: Code chunk UUID (required for mode="related_memories")
         memory_uuid: Memory UUID (required for mode="related_code")
         output_format: Response format - "toon" (default) or "json"
+        include_related_memories: Include related debugging memories for each code result (default: False)
+        related_memories_limit: Max related memories per code result (default: 3)
 
     Returns:
-        For search: {"results": [...]}
+        For search: {"results": [...]} (with optional related_memories per result)
         For related_*: {"related_memories/related_code": [...], "count": N}
         For stats: {"chunk_count": N, "unique_files": N}
         On error: {"error": "<error-message>"}
@@ -733,6 +740,8 @@ async def search_code(
                 project_id=resolved_project_id,
                 content_mode=content_mode,
                 output_format=output_format or OUTPUT_FORMAT,
+                include_related_memories=include_related_memories,
+                related_memories_limit=related_memories_limit,
             )
 
         elif mode == "related_memories":

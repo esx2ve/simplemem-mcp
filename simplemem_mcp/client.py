@@ -456,6 +456,8 @@ class BackendClient:
         project_id: str | None = None,
         content_mode: str = "preview",
         output_format: str | None = None,
+        include_related_memories: bool = False,
+        related_memories_limit: int = 3,
     ) -> dict | str:
         """Search code via backend API.
 
@@ -468,6 +470,8 @@ class BackendClient:
                 - 'preview': Signature + truncated body (~80 tokens)
                 - 'full': Complete content (~400 tokens)
             output_format: Response format ('toon' or 'json')
+            include_related_memories: Include related debugging memories per code result
+            related_memories_limit: Max related memories per result (default 3)
 
         Returns:
             Search results dict or TOON string
@@ -477,6 +481,9 @@ class BackendClient:
             data["project_id"] = project_id
         if output_format:
             data["output_format"] = output_format
+        if include_related_memories:
+            data["include_related_memories"] = include_related_memories
+            data["related_memories_limit"] = related_memories_limit
         return await self._request("POST", "/api/v1/code/search", json_data=data)
 
     async def code_stats(self, project_id: str | None = None) -> dict:
